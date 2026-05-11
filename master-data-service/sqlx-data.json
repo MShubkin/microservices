@@ -1,0 +1,169 @@
+{
+  "db": "PostgreSQL",
+  "19f8198abf983793d9830ccd30c64e70dd2042b309b0d4ff6f35214c2df59963": {
+    "query": "\n            INSERT INTO request_pos(\n                    uuid,\n                    uuid_req,\n                    uuid_p_pos,\n                    posid,\n                    pos_name,\n                    start_date,\n                    end_date,\n                    purch_form,\n                    budget_item_id,\n                    payment_balance_item_id,\n                    okved_id,\n                    okato_id,\n                    is_not_russian_delivery,\n                    note\n            ) SELECT * FROM UNNEST($1::uuid[], $2::uuid[],  $3::uuid[],  $4::int2[],  $5::text[],  $6::date[],  $7::date[],  $8::int4[],  $9::int4[],  $10::int4[],  $11::int4[],  $12::int4[], $13::bool[],  $14::text[])",
+    "describe": {
+      "columns": [],
+      "parameters": {
+        "Left": [
+          "UuidArray",
+          "UuidArray",
+          "UuidArray",
+          "Int2Array",
+          "TextArray",
+          "DateArray",
+          "DateArray",
+          "Int4Array",
+          "Int4Array",
+          "Int4Array",
+          "Int4Array",
+          "Int4Array",
+          "BoolArray",
+          "TextArray"
+        ]
+      },
+      "nullable": []
+    }
+  },
+  "260044bace9fb4f6123df6cf859e34404b24c260513e4c5262269100a03930b1": {
+    "query": "INSERT INTO request_partner_ust(uuid_partner, status_id) SELECT * FROM UNNEST($1::uuid[], $2::int2[])",
+    "describe": {
+      "columns": [],
+      "parameters": {
+        "Left": [
+          "UuidArray",
+          "Int2Array"
+        ]
+      },
+      "nullable": []
+    }
+  },
+  "4522c2f17227ccbc83c3fecb57d6094c6eea32f25b26e3e05cec3e804677caa5": {
+    "query": "delete from request_partner WHERE uuid_partner = ANY($1)",
+    "describe": {
+      "columns": [],
+      "parameters": {
+        "Left": [
+          "UuidArray"
+        ]
+      },
+      "nullable": []
+    }
+  },
+  "57b52111cb73275995df13e305a0ab50636c0fdeed8b49dc4d124b4826146004": {
+    "query": "\n            INSERT INTO request_partner(\n                uuid_partner,\n                uuid_req,\n                id,\n                supplier_id,\n                supplier_id_obd,\n                supplier_id_gpb,\n                supplier_text,\n                email,\n                email_add,\n                full_name\n            ) SELECT * FROM UNNEST($1::uuid[], $2::uuid[],  $3::int4[],  $4::int4[],  $5::int4[],  $6::int4[],  $7::text[],  $8::text[],  $9::text[],  $10::text[])",
+    "describe": {
+      "columns": [],
+      "parameters": {
+        "Left": [
+          "UuidArray",
+          "UuidArray",
+          "Int4Array",
+          "Int4Array",
+          "Int4Array",
+          "Int4Array",
+          "TextArray",
+          "TextArray",
+          "TextArray",
+          "TextArray"
+        ]
+      },
+      "nullable": []
+    }
+  },
+  "5c44a9739de35bba8e62452c5d42a86775f2f852c62e41845f4cb131822e847d": {
+    "query": "delete from req_head WHERE uuid_req = ANY($1)",
+    "describe": {
+      "columns": [],
+      "parameters": {
+        "Left": [
+          "UuidArray"
+        ]
+      },
+      "nullable": []
+    }
+  },
+  "82211a469ec4bbf15c459320a08946d5b70a11146a3f4a034f41582d0ab20cc3": {
+    "query": "delete from request_pos WHERE uuid = ANY($1)",
+    "describe": {
+      "columns": [],
+      "parameters": {
+        "Left": [
+          "UuidArray"
+        ]
+      },
+      "nullable": []
+    }
+  },
+  "8676d2fec4b7edddd7fdcaaef0168bb30ec4b7180516929881659dc06704c4f9": {
+    "query": "\n            INSERT INTO req_head(\n                uuid_req,\n                uuid_p,\n                id_p,\n                type_req,\n                status_id,\n                purch_type,\n                customer_id,\n                end_date,\n                note,\n                created_at,\n                creator_id,\n                changed_at,\n                changed_id\n            ) SELECT * FROM UNNEST($1::uuid[], $2::uuid[], $3::int4[],  $4::int2[],  $5::int2[],  $6::int2[],  $7::int4[],  $8::date[],  $9::text[],  $10::timestamp[],  $11::text[],  $12::timestamp[],  $13::text[])",
+    "describe": {
+      "columns": [],
+      "parameters": {
+        "Left": [
+          "UuidArray",
+          "UuidArray",
+          "Int4Array",
+          "Int2Array",
+          "Int2Array",
+          "Int2Array",
+          "Int4Array",
+          "DateArray",
+          "TextArray",
+          "TimestampArray",
+          "TextArray",
+          "TimestampArray",
+          "TextArray"
+        ]
+      },
+      "nullable": []
+    }
+  },
+  "a501a625b71c58dddbdfc4c2d7953611b0497dad5aeada2dab5cf2e4c0eb8ea1": {
+    "query": "delete from object_doc WHERE uuid_doc = ANY($1)",
+    "describe": {
+      "columns": [],
+      "parameters": {
+        "Left": [
+          "UuidArray"
+        ]
+      },
+      "nullable": []
+    }
+  },
+  "aa8e38047d6f786b4fd3862894a20c828cd7294674e0e57cbe2ec7ca13a16944": {
+    "query": "\n            INSERT INTO object_doc(\n                    uuid_doc,\n                    uuid_obj,\n                    doc_name,\n                    serv_uuid,\n                    doc_type,\n                    file_extension,\n                    file_size,\n                    del_ind,\n                    created_at,\n                    created_by,\n                    changed_at,\n                    changed_by\n            ) SELECT * FROM UNNEST($1::uuid[], $2::uuid[], $3::text[],  $4::uuid[],  $5::int2[],  $6::text[],  $7::int8[],  $8::bool[],  $9::timestamp[],  $10::text[],  $11::timestamp[],  $12::text[])",
+    "describe": {
+      "columns": [],
+      "parameters": {
+        "Left": [
+          "UuidArray",
+          "UuidArray",
+          "TextArray",
+          "UuidArray",
+          "Int2Array",
+          "TextArray",
+          "Int8Array",
+          "BoolArray",
+          "TimestampArray",
+          "TextArray",
+          "TimestampArray",
+          "TextArray"
+        ]
+      },
+      "nullable": []
+    }
+  },
+  "db5fcb4bfe8285dca850934d33d3aaa49fdcbfcd97cc4cc3376aa572400628ba": {
+    "query": "delete from request_partner_ust WHERE uuid_partner = ANY($1)",
+    "describe": {
+      "columns": [],
+      "parameters": {
+        "Left": [
+          "UuidArray"
+        ]
+      },
+      "nullable": []
+    }
+  }
+}

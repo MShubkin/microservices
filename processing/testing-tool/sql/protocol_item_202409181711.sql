@@ -1,0 +1,14 @@
+TRUNCATE TABLE public.protocol_item;
+
+INSERT INTO public.protocol_item ("uuid",protocol_uuid,source_uuid,"number",is_registered_by_d647,is_removed,is_excluded,result_id,sum_excluded_vat,pricing_sum_excluded_vat,commission_sum_excluded_vat,created_at,changed_at,created_by,changed_by) VALUES
+	 ('ccdfc595-0fcb-4da6-aedb-7c516b6e7848'::uuid,'62c669b2-11ab-44eb-a71d-2c99ec3ad32a'::uuid,'f922336c-34b5-43ab-9488-87930ca98285'::uuid,1,false,false,false,0,NULL,NULL,NULL,'2024-09-17 12:02:14.020991','2024-09-17 12:02:14.020991',0,0),
+	 ('a140ec63-a3b7-4fcd-8970-af8986a0b512'::uuid,'62c669b2-11ab-44eb-a71d-2c99ec3ad32a'::uuid,'08483814-4f69-4f33-84c0-0f224132bb1c'::uuid,0,false,true,false,0,NULL,NULL,NULL,'2024-09-17 12:02:14.020987','2024-09-17 12:02:14.020987',0,0),
+	 ('becf1f0d-d8b6-4d56-b455-edaa8d949cc4'::uuid,'dfdf8e29-1141-4a86-8406-4aff41b84085'::uuid,'8f93077a-11b9-401c-93dd-0487e06c93ee'::uuid,0,false,false,false,0,NULL,NULL,NULL,'2024-09-18 12:25:38.392565','2024-09-18 12:25:38.392565',0,0),
+	 ('a3f1f4ac-5c07-4fea-9cab-9190405f7fa5'::uuid,'dfdf8e29-1141-4a86-8406-4aff41b84085'::uuid,'c192544d-e20a-44b3-99f7-a1578b23bad7'::uuid,1,false,false,false,0,NULL,NULL,NULL,'2024-09-18 12:25:38.392569','2024-09-18 12:25:38.392569',0,0),
+	 ('d3a94cf6-d0e2-43ab-a790-5aa37d96628b'::uuid,'dfdf8e29-1141-4a86-8406-4aff41b84085'::uuid,'08483814-4f69-4f33-84c0-0f224132bb1c'::uuid,2,false,false,false,0,NULL,NULL,NULL,'2024-09-18 12:25:38.392571','2024-09-18 12:25:38.392571',0,0),
+	 ('8a080928-8a8d-40bf-8068-7a0a80caa0d4'::uuid,'dfdf8e29-1141-4a86-8406-4aff41b84085'::uuid,'39137cba-8173-460c-b378-0a205489ca95'::uuid,3,false,false,false,0,NULL,NULL,NULL,'2024-09-18 12:25:38.392574','2024-09-18 12:25:38.392574',0,0),
+	 ('1c114875-345c-45ac-b3c5-4dff40dfcbca'::uuid,'dfdf8e29-1141-4a86-8406-4aff41b84085'::uuid,'953c5449-094d-40f9-8731-3964c68d9fac'::uuid,4,false,false,false,0,NULL,NULL,NULL,'2024-09-18 12:25:38.392576','2024-09-18 12:25:38.392576',0,0),
+	 ('d253a0c2-5d7f-4ba6-a6b6-7bc1c3d0770e'::uuid,'dfdf8e29-1141-4a86-8406-4aff41b84085'::uuid,'3eda4de3-b578-49ab-aee8-516b1690a386'::uuid,5,false,false,false,0,NULL,NULL,NULL,'2024-09-18 12:25:38.392579','2024-09-18 12:25:38.392579',0,0),
+	 ('1f0b03f4-14cb-4ea0-8145-a439564df9ac'::uuid,'dfdf8e29-1141-4a86-8406-4aff41b84085'::uuid,'c192544d-e20a-44b3-99f7-a1578b23bad7'::uuid,6,false,false,false,0,NULL,NULL,NULL,'2024-09-18 12:25:38.39258','2024-09-18 12:25:38.39258',0,0),
+	 ('27bfe1d6-e987-423b-b5a4-a5ba002ba6b9'::uuid,'dfdf8e29-1141-4a86-8406-4aff41b84085'::uuid,'8f93077a-11b9-401c-93dd-0487e06c93ee'::uuid,7,false,false,false,0,NULL,NULL,NULL,'2024-09-18 12:25:38.392581','2024-09-18 12:25:38.392581',0,0),
+	 ('d0b4e80b-5b65-4ed8-a4ff-0bdcddd6468b'::uuid,'dfdf8e29-1141-4a86-8406-4aff41b84085'::uuid,'2d170cc4-acb0-4f8b-8a81-204255bbf0e1'::uuid,8,false,false,false,0,NULL,NULL,NULL,'2024-09-18 12:25:38.392583','2024-09-18 12:25:38.392583',0,0);

@@ -1,0 +1,182 @@
+INSERT INTO plan(
+    uuid,
+    id,
+    contract_subject,
+    commission_kind_id,
+    customer_id,
+    supplier_id,
+    sum_excluded_vat,
+    sum_excluded_vat_rub,
+    currency_id,
+    currency_rate,
+    purchasing_type_id,
+    status_id,
+    delivery_start_date,
+    delivery_end_date,
+    created_by,
+    changed_by,
+    pricing_organization_unit_id,
+    created_at,
+    changed_at,
+    pricing_sum_excluded_vat) values
+        ('00000000-0000-0000-0000-000000000001',1,'Слишком много комаров',1,2,3,100,5,6,10,7,252,now()::date,now()::date,99,99,2,now()::date,now()::date, 200),
+        ('00000000-0000-0000-0000-000000000002',2,'Слишком много комаров',1,2,3,100,5,6,10,7,251,now()::date,now()::date,99,99,2,now()::date,now()::date, 200),
+        ('00000000-0000-0000-0000-000000000003',3,'Слишком много комаров',1,2,3,100,5,6,10,7,251,now()::date,now()::date,99,99,2,now()::date,now()::date, 200),
+        ('00000000-0000-0000-0000-000000000004',4,'Слишком много комаров',1,2,3,100,5,6,10,7,251,now()::date,now()::date,99,99,1,now()::date,now()::date, 200),
+        ('00000000-0000-0000-0000-000000000005',5,'Слишком много комаров',1,2,3,100,5,6,10,7,251,now()::date,now()::date,99,99,2,now()::date,now()::date, 200);
+
+
+INSERT INTO contract_amendment(
+    uuid,
+    id,
+    contract_subject,
+    customer_id,
+    supplier_id,
+    sum_excluded_vat,
+    currency_id,
+    status_id,
+    created_by,
+    changed_by,
+    created_at,
+    changed_at,
+    pricing_expert_id,
+    pricing_organization_unit_id,
+    pricing_resume,
+    section_id,
+    commission_kind_id,
+    purchasing_type_id,
+    pricing_sum_excluded_vat,
+    delta_sum_excluded_vat,
+    pricing_delta_sum_excluded_vat) values
+        ('00000000-0000-0000-0000-000000000011',11,'InPerson registered',2,3,100,6,252,99,99,now()::date,now()::date, 1, 2, 'Resume', 1, 1, 1, 100, 200, 300),
+        ('00000000-0000-0000-0000-000000000012',12,'InPerson registered',2,3,100,6,251,99,99,now()::date,now()::date, 1, 2, 'Resume', 1, 1, 1, 100, 200, 300),
+        ('00000000-0000-0000-0000-000000000013',13,'InPerson registered',2,3,100,6,251,99,99,now()::date,now()::date, 1, 2, 'Resume', 1, 1, 1, 100, 200, 300),
+        ('00000000-0000-0000-0000-000000000014',14,'InPerson registered',2,3,100,6,251,99,99,now()::date,now()::date, 1, 2, 'Resume', 1, 1, 1, 100, 200, 300),
+        ('00000000-0000-0000-0000-000000000015',15,'InPerson registered',2,3,100,6,251,99,99,now()::date,now()::date, 1, 2, 'Resume', 1, 1, 1, 100, 200, 300);
+
+
+INSERT INTO protocol(
+    uuid,
+    id,
+    protocol_type_id,
+    registration_number,
+    status_id,
+    pricing_organization_unit_id,
+    is_secret,
+    is_removed,
+    created_by,
+    changed_by,
+    created_at,
+    changed_at,
+    protocol_date) values
+        ('00000000-0000-0000-0000-000000000001','1',1,253,100,1,false,false,99,99,'1900-01-01','1900-01-01','1910-01-01');
+
+INSERT INTO protocol_item(
+    uuid,
+    protocol_uuid,
+    source_uuid,
+    result_id,
+    number,
+    is_registered_by_d647,
+    is_removed,
+    created_at,
+    changed_at,
+    created_by,
+    changed_by) values
+        ('00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000002',2,102,false,false,'1900-01-02','1900-01-01',99,99),
+        ('00000000-0000-0000-0000-000000000002','00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000012',2,103,false,false,'1900-01-03','1900-01-01',99,99);
+
+INSERT INTO agenda(
+    uuid,
+    id,
+    meeting_date,
+    status_id,
+    pricing_organization_unit_id,
+    is_removed,
+    created_at,
+    changed_at,
+    created_by,
+    changed_by) values
+        ('00000000-0000-0000-0000-000000000001',1,'1900-01-01',100,2,false,'1900-01-01','1900-01-01',99,99),
+        ('00000000-0000-0000-0000-000000000002',2,'1900-01-02',100,2,false,'2000-01-01','1900-01-01',99,99),
+        -- Невалидный статус
+        ('00000000-0000-0000-0000-000000000003',3,'1900-01-03',300,2,false,'2100-01-01','1900-01-01',99,99),
+        ('00000000-0000-0000-0000-000000000004',4,'1900-01-03',100,2,false,'2100-01-01','1900-01-01',99,99);
+
+INSERT INTO agenda_item(
+    uuid,
+    agenda_uuid,
+    source_uuid,
+    number,
+    is_registered_by_d647,
+    is_removed,
+    is_excluded,
+    created_at,
+    changed_at,
+    created_by,
+    changed_by,
+    sum_excluded_vat,
+    pricing_sum_excluded_vat
+    ) values
+        ('00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000001','1',false,false,false,'1900-01-01','1900-01-01',99,99, 100, 200),
+        ('00000000-0000-0000-0000-000000000002','00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000011','1',false,false,false,'1900-01-01','1900-01-01',99,99, 200, 300),
+        ('00000000-0000-0000-0000-000000000003','00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000002','1',false,false,false,'1900-01-01','1900-01-01',99,99, 100, 200),
+        ('00000000-0000-0000-0000-000000000004','00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000012','1',false,false,false,'1900-01-01','1900-01-01',99,99, 100, 200),
+        
+        ('00000000-0000-0000-0000-000000000005','00000000-0000-0000-0000-000000000002','00000000-0000-0000-0000-000000000003',1,true,false,false,'1900-01-01','1900-01-01',99,99, 100, 200),
+        ('00000000-0000-0000-0000-000000000006','00000000-0000-0000-0000-000000000002','00000000-0000-0000-0000-000000000013',2,true,false,false,'1900-01-01','1900-01-01',99,99, 0, 0),
+        ('00000000-0000-0000-0000-000000000007','00000000-0000-0000-0000-000000000002','00000000-0000-0000-0000-000000000004',3,false,false,false,'1900-01-01','1900-01-01',99,99, 200, 300),
+        ('00000000-0000-0000-0000-000000000008','00000000-0000-0000-0000-000000000002','00000000-0000-0000-0000-000000000005',4,false,true,false,'1900-01-01','1900-01-01',99,99, 200, 300),
+        
+        ('00000000-0000-0000-0000-000000000009','00000000-0000-0000-0000-000000000004','00000000-0000-0000-0000-000000000014',1,false,false,false,'1900-01-01','1900-01-01',99,99, 100, 200),
+        ('00000000-0000-0000-0000-000000000010','00000000-0000-0000-0000-000000000004','00000000-0000-0000-0000-000000000003',2,true,true,false,'1900-01-01','1900-01-01',99,99, 100, 200),
+        ('00000000-0000-0000-0000-000000000011','00000000-0000-0000-0000-000000000004','00000000-0000-0000-0000-000000000013',3,true,false,true,'1900-01-01','1900-01-01',99,99, 0, 0);
+
+INSERT INTO item_relation_agenda_protocol(agenda_item_uuid, agenda_uuid, protocol_uuid, protocol_item_uuid, created_at, created_by) values
+        ('00000000-0000-0000-0000-000000000010','00000000-0000-0000-0000-000000000004','00000000-0000-0000-0000-000000000003','00000000-0000-0000-0000-000000000005',now()::timestamp,99);
+
+-- Version updates fail if there are no versions, so we create them manually.
+ALTER TABLE plan_version DROP COLUMN pricing_version;
+ALTER TABLE plan_version ADD COLUMN pricing_version SMALLINT NOT NULL;
+INSERT INTO plan_version (SELECT *,1 pricing_version FROM plan);
+INSERT INTO contract_amendment_version(
+    uuid,
+    id,
+    commission_kind_id,
+    purchasing_type_id,
+    status_id,
+    year,
+    is_check_documentation,
+    pricing_expert_id,
+    contract_subject,
+    customer_id,
+    supplier_id,
+    sum_excluded_vat,
+    currency_id,  
+    pricing_resume,
+    section_id,
+    created_at,
+    changed_at,
+    created_by,
+    changed_by,
+    pricing_version
+) (SELECT 
+    uuid,
+    id,
+    commission_kind_id,
+    purchasing_type_id,
+    status_id,
+    year,
+    is_check_documentation,
+    pricing_expert_id,
+    contract_subject,
+    customer_id,
+    supplier_id,
+    sum_excluded_vat,
+    currency_id,  
+    pricing_resume,
+    section_id,
+    created_at,
+    changed_at,
+    created_by,
+    changed_by,1 FROM contract_amendment);

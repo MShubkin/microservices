@@ -1,0 +1,1 @@
+DROP TABLE public.plan_reason_cancel_check_reason;

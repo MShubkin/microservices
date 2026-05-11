@@ -1,0 +1,39 @@
+[package]
+name = "broker"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "broker"
+path = "src/lib.rs"
+
+[features]
+default = []
+full = ["traces"]
+traces = ["tracing"]
+highload-tests = []
+
+# Highload tests
+[[bin]]
+name = "rabbit-listener"
+path = "highload-tests/rabbit/listener.rs"
+required-features = ["highload-tests"]
+
+[[bin]]
+name = "rabbit-not-fixed-channel-count-publisher"
+path = "highload-tests/rabbit/not-fixed-channel-count-publisher.rs"
+required-features = ["highload-tests"]
+
+[dependencies]
+amqprs.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+# `traces` feature
+tracing = { workspace = true, optional = true }

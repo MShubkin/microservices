@@ -1,0 +1,1 @@
+DROP TABLE public.contract_amendment_item_version;

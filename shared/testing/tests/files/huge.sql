@@ -1,0 +1,334 @@
+drop table if exists huge;
+create table huge(
+    id serial
+);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);
+insert into multiple values (default);

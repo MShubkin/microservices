@@ -1,0 +1,31 @@
+{
+    "rabbit_cfg": {
+        "host": "localhost",
+        "port": 5672,
+        "user": "guest",
+        "pw": "guest",
+        "retries": 10,
+        "retry_interval_ns": 500
+    },
+    "db_config": {
+        "host": "localhost",
+        "db_name": "testdb1",
+        "user": "zav",
+        "pw": "zav",
+        "min_connections": 1,
+        "max_connections": 4,
+        "timeout_s": 10,
+        "connection_refresh_s": 3600
+    },
+    "plans": {
+        "host": "127.0.0.1",
+        "port": 3000
+    },
+    "tracing": {
+        "Cef": {
+            "dir": "logs",
+            "file": "processing"
+        }
+    },
+    "server_thread_count": 7
+}

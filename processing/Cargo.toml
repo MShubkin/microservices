@@ -1,0 +1,56 @@
+[package]
+name = "processing"
+version = "0.0.1"
+edition = "2021"
+default-run = "processing"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[[bin]]
+name = "processing"
+
+[[bin]]
+name = "sql-testing-tool"
+path = "testing-tool/testing-tool.rs"
+
+[dependencies]
+# local
+asez2-shared-db = { path = "../shared/shared-db" }
+broker = { path = "../shared/broker", features = ["traces"] }
+env-setup = { path = "../shared/env-setup" }
+rabbit-services = { path = "../shared/rabbit-services", features = ["processing", "specialized-departments", "master-data"]}
+shared-essential = { path = "../shared/shared-essential" }
+trace-setup = { path = "../shared/trace-setup" }
+igg-tracing = { path = "../shared/igg-tracing" }
+monolith-service = { path = "../shared/monolith-service" }
+
+# foreign
+actix-cors.workspace = true
+actix-web.workspace = true
+ahash.workspace = true
+amqprs.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+itertools.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+derive_more.workspace = true
+
+[dev-dependencies]
+asez2-tables = { path = "../shared/table-entities/" }
+testing = { path = "../shared/testing", features = ["monolith"]}
+
+anyhow.workspace = true
+
+[features]
+integration_tests = []
+advanced-cancellation-control = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(with_plan_db)'] }

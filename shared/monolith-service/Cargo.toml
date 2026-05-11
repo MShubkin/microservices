@@ -1,0 +1,27 @@
+[package]
+name = "monolith-service"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+asez2-shared-db = { path = "../shared-db" }
+
+actix-http.workspace = true
+actix-web.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+sqlx.workspace = true
+
+[dev-dependencies]
+env-setup = { path = "../env-setup" }
+tokio.workspace = true
+tracing.workspace = true
+sqlx.workspace = true

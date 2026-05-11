@@ -1,0 +1,46 @@
+[package]
+name = "shared-essential"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+show_passwords = []
+
+[dependencies]
+# Local
+asez2-shared-db = { path = "../shared-db" }
+asez2-tables = { path = "../table-entities"}
+broker = { path = "../broker" }
+env-setup = { path = "../env-setup" }
+monolith-service = { path = "../monolith-service" }
+fieldname-access = { path = "../fieldname-access" }
+testing = { path = "../testing" }
+
+# Foreign
+actix-web.workspace = true
+ahash.workspace = true
+amqprs.workspace = true
+async-trait.workspace = true
+bzip2.workspace = true
+futures.workspace = true
+derive_more.workspace = true
+paste.workspace = true
+quick-xml.workspace = true
+rand.workspace = true
+rayon.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+url.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+actix-multipart.workspace = true
+itertools.workspace = true
+humantime.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

@@ -1,0 +1,29 @@
+{
+  "db": "PostgreSQL",
+  "7c319636438385bdfe3f7729140f83a9a7b5e6bc328101efc6534730575b0bfb": {
+    "describe": {
+      "columns": [
+        {
+          "name": "agenda_uuid",
+          "ordinal": 0,
+          "type_info": "Uuid"
+        },
+        {
+          "name": "registration_number",
+          "ordinal": 1,
+          "type_info": "Varchar"
+        }
+      ],
+      "nullable": [
+        true,
+        true
+      ],
+      "parameters": {
+        "Left": [
+          "UuidArray"
+        ]
+      }
+    },
+    "query": "SELECT apr.agenda_uuid, ecp.registration_number FROM agenda_protocol_relation apr INNER JOIN protocol ecp ON ecp.uuid=apr.protocol_uuid WHERE apr.agenda_uuid = ANY($1)"
+  }
+}

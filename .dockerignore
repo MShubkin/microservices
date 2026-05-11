@@ -1,0 +1,33 @@
+# IDE
+/**/**/.vscode/
+/**/**/.idea/
+# GIT
+/**/**/.git/
+
+# DEVOPS - docker files
+/**/**/Dockerfile
+/**/**/Dockerfile.prod
+/**/**/Dockerfile**
+
+# DEVOPS - docker-compose files
+/**/**/docker-compose.yaml
+/**/**/docker-compose.infra.yaml
+/**/**/docker-compose.services.yaml
+
+# DEVOPS - bash scripts, not used in docker image
+/devops
+/.cicd
+
+# DEVOPS - k8s scripts
+/**/**/.helm
+/**/**/werf.yaml
+/**/**/werfbuild.sh
+
+# Build artefacts
+/**/**/target
+
+# Running logs
+/**/**/logs/
+
+# .env files - we will be use config maps
+#/**/**/.env

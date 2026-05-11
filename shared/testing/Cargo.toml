@@ -1,0 +1,31 @@
+[package]
+name = "testing"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+asez2-shared-db = { path = "../shared-db" }
+env-setup = { path = "../env-setup" }
+asez-macros.path = "../macros"
+
+monolith-service = { path = "../monolith-service", optional = true }
+
+async-trait.workspace = true
+itertools.workspace = true
+futures.workspace = true
+tracing.workspace = true
+serde.workspace = true
+time.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+sqlx.workspace = true
+
+actix-web = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+anyhow.workspace = true
+
+[features]
+default = []
+monolith = ["monolith-service", "actix-web", "serde_json"]

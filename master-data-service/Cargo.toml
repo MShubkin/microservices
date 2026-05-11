@@ -1,0 +1,65 @@
+[package]
+name = "master-data-service"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+path = "src/main.rs"
+name = "master-data-service"
+
+[lib]
+path = "src/lib.rs"
+
+
+[dependencies]
+# local
+asez2-shared-db = { path = "../shared/shared-db" }
+broker = { path = "../shared/broker", features = ["traces"] }
+env-setup = { path = "../shared/env-setup" }
+http-middleware = { path = "../shared/http-middleware" }
+igg-tracing = { path = "../shared/igg-tracing" }
+rabbit-services = { path = "../shared/rabbit-services", features = ["print-doc"]}
+shared-db-derive = { path = "../shared/shared-db-derive" }
+shared-essential = { path = "../shared/shared-essential" }
+trace-setup = { path = "../shared/trace-setup" }
+monolith-service = { path = "../shared/monolith-service" }
+format-tools = { path = "../shared/format-tools" }
+
+# foreign
+actix-cors.workspace = true
+actix-web.workspace = true
+amqprs.workspace = true
+async-trait.workspace = true
+derive_more.workspace = true
+futures.workspace = true
+lazy_static.workspace = true
+once_cell.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-actix-web.workspace = true
+tracing-bunyan-formatter.workspace = true
+tracing-futures.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+uuid.workspace = true
+itertools.workspace = true
+ahash.workspace = true
+regex.workspace = true
+
+[dev-dependencies]
+testing = { path = "../shared/testing", features = ["monolith"]}
+hyper.workspace = true
+actix-http.workspace = true
+tracing-appender.workspace = true
+sqlx.workspace = true
+
+[features]
+default = ["integration_tests", "show_passwords"]
+integration_tests = []
+show_passwords = []

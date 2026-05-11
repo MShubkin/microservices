@@ -1,0 +1,27 @@
+[package]
+name = "igg-tracing"
+version = "0.0.1"
+edition = "2021"
+
+# See: https://doc.rust-lang.org/cargo/reference/manifest.html
+# NB: Dependencies should be as broad based as possible, however we must be
+# careful due to the limitation of:
+# a) Using an older compiler.
+# b) Using a limited registry.
+[dependencies]
+time.workspace = true
+actix-web = { workspace = true, optional = true }
+tracing-actix-web = { workspace = true, optional = true }
+tracing-subscriber.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+uuid.workspace = true
+amqprs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+regex.workspace = true
+
+[features]
+with-actix-web = ["actix-web", "tracing-actix-web"]
+default = ["with-actix-web"]

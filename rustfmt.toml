@@ -1,0 +1,5 @@
+max_width = 84
+array_width = 72
+chain_width = 72
+fn_call_width = 72
+edition = "2018"

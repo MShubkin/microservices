@@ -1,0 +1,57 @@
+[package]
+name = "rabbit-services"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+default = []
+all = [
+    "notification", 
+    "processing", 
+    "view-storage", 
+    "integration", 
+    "master-data", 
+    "print-doc", 
+    "log-storage", 
+    "scheduler",
+    "technical-commercial-proposal",
+    "specialized-departments",
+]
+notification = []
+processing = []
+view-storage = []
+integration = []
+master-data = []
+print-doc = []
+log-storage = []
+scheduler = []
+technical-commercial-proposal = []
+specialized-departments = []
+# Enable if you want to ignore calls to view-storage "allowed fields" request
+stub-view-storage = []
+
+[dependencies]
+# Local
+broker = { path = "../broker", features = ["traces"] }
+shared-essential = { path = "../shared-essential" }
+igg-tracing = { path = "../igg-tracing" }
+
+# Foreign
+amqprs.workspace = true
+amqp_serde.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+time.workspace = true
+tracing.workspace = true
+actix-web.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing-actix-web.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
