@@ -8,8 +8,15 @@ use actix_web::{
 use futures::future::LocalBoxFuture;
 use rabbit_services::properties::AsezRabbitProperties;
 
-/// Middleware that inject default rabbit properties
-/// to be used when calling remote services via Rabbit broker.
+/// Middleware, которая кладёт `AsezRabbitProperties` в extensions каждого запроса.
+///
+/// `AsezRabbitProperties` — контейнер для метаданных, которые уйдут в AMQP-заголовки
+/// при вызове других сервисов через RabbitMQ. Middleware создаёт пустой экземпляр,
+/// а последующие middleware (в первую очередь `AsezSessionWatcher`) дополняют его
+/// `user_id`, `user_name` и другими полями по мере прохождения запроса.
+///
+/// Должна быть зарегистрирована раньше всех остальных через `.wrap()`,
+/// потому что в Actix wrap-и выполняются в обратном порядке.
 pub struct DefaultRabbitProperties;
 
 impl<S, B> Transform<S, ServiceRequest> for DefaultRabbitProperties
@@ -34,7 +41,9 @@ where
     }
 }
 
-/// Service that injects instance of default rabbit properties into request.
+/// Фактическая реализация middleware — клонирует дефолтные `AsezRabbitProperties`
+/// в extensions запроса. `Clone` дешёвый: структура содержит только `Option<String>`
+/// и числа, без Arc или аллокаций.
 pub struct DefaultRabbitPropertiesService<S> {
     service: S,
     properties: AsezRabbitProperties,

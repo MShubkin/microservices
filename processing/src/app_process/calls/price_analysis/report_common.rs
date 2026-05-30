@@ -138,7 +138,7 @@ pub(crate) async fn pricing_report_common_data(
             .into_iter()
             .map(|item| item.object_uuid)
             .collect::<HashSet<uuid::Uuid>>();
-    println!("{:?}", document_uuids);
+    tracing::debug!(kind = "report", document_count = document_uuids.len(), "собранные uuid документов");
     let document_uuid_values: Vec<Value> =
         document_uuids.into_iter().map(Value::Uuid).collect();
 

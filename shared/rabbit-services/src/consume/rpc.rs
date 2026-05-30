@@ -19,11 +19,15 @@ use crate::{
     CONTENT_TYPE,
 };
 
-/// Консьюмер для обработки RPC-подобных запросов (direct reply_to).
+/// Консьюмер для обработки RPC-запросов с ответом через `reply_to`.
 ///
-/// - [ ] Принимает запрос из очереди
-/// - [ ] Вызывает обработчик с полученными данными
-/// - [ ] Отправляет ответ обратно
+/// Серверная сторона паттерна RPC: принимает запрос из именованной очереди,
+/// передаёт его обработчику и отправляет результат в очередь, указанную в
+/// поле `reply_to` входящего сообщения. Именно туда клиент подписал консьюмера
+/// через `amq.rabbitmq.reply-to`.
+///
+/// Ошибки обработчика сериализуются и тоже отправляются клиенту -- клиент
+/// должен уметь их разобрать.
 pub struct RabbitConsumerForRpc<H, I, O, E> {
     adapter: Arc<RabbitAdapter>,
     queue: String,
@@ -32,12 +36,13 @@ pub struct RabbitConsumerForRpc<H, I, O, E> {
     _phantom_data: PhantomData<(I, O, E)>,
 }
 
+/// Результат работы RPC-обработчика: успех или типизированная ошибка.
 pub type RpcHandlerResult<O, E> = std::result::Result<O, E>;
 
-/// Хэндлер вызова RPC через кролика. На основе входного значения возвращает
-/// данные через стандартный ответ
-/// ([`ApiResponse`](shared_essential::request_response::ApiResponse)) или
-/// ошибку, преобразуемую к `AsezError`.
+/// Обработчик RPC-вызова: принимает десериализованный запрос и возвращает ответ или ошибку.
+///
+/// Реализация через замыкание предоставляется автоматически (см. impl ниже).
+/// Для сервисов с более сложной логикой можно реализовать трейт на структуре.
 pub trait ConsumerRpcHandler<I, O, E> {
     fn handle(&self, input: I) -> BoxFuture<'static, RpcHandlerResult<O, E>>;
 }
@@ -74,6 +79,11 @@ where
         }
     }
 
+    /// Объявляет очередь, регистрирует паблишер для ответов и запускает основной цикл.
+    ///
+    /// Очередь объявляется с флагом durable, паблишер регистрируется с пустым
+    /// exchange и пустым routing_key -- конкретный адрес `reply_to` подставляется
+    /// на каждое сообщение внутри [`BasicHandlerForRpc`].
     pub async fn run(self) -> Result<ConsumerServer> {
         let RabbitConsumerForRpc {
             adapter,
@@ -89,6 +99,7 @@ where
 
         tracing::info!("registering RPC response publisher");
         let basic_props = BasicProperties::default();
+        // Пустой routing_key: конкретный адрес будет браться из reply_to каждого запроса.
         let publish_args = BasicPublishArguments::new("", "");
         let publisher =
             adapter.register_publisher(basic_props, publish_args).await?;
@@ -105,6 +116,10 @@ where
     }
 }
 
+/// Адаптер между [`BasicConsumerHandler`] и [`ConsumerRpcHandler`].
+///
+/// Оборачивает пользовательский обработчик и добавляет логику отправки ответа:
+/// берёт `reply_to` из входящего сообщения и публикует результат туда.
 struct BasicHandlerForRpc<H, I, O, E> {
     publisher: Arc<RabbitPublisher>,
     handler: Arc<H>,

@@ -1,5 +1,11 @@
-//! Currently DbItem requires default to be derived for fields.
-//! Date and time do not derive this, so we must provide types that do.
+//! Обёртки над типами дат и времени для [`DbItem`].
+//!
+//! [`sqlx::types::time::Date`] и [`sqlx::types::time::PrimitiveDateTime`] не реализуют
+//! [`Default`], поэтому их нельзя использовать напрямую в структурах, которые
+//! требуют `#[derive(Default)]` для работы с `activate_fields`.
+//!
+//! `AsezDate` и `AsezTimestamp` решают эту проблему: они оборачивают оригинальные типы
+//! и реализуют `Default` как `1901-01-01` -- условную "пустую" дату в системе.
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
 use sqlx::{
     encode::IsNull,
@@ -14,7 +20,9 @@ use sqlx::{
 use std::{fmt::Display, ops::Deref, time::Duration};
 use time::Weekday;
 
+/// Формат дат в БД (`YYYY-MM-DD`).
 pub(crate) const DB_DATE_FORMAT: &str = "%Y-%m-%d";
+/// Формат временных меток в БД (`YYYY-MM-DD HH:MM:SS`).
 pub(crate) const DB_TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 
 /// Формат, в котором реализован [`Display`] для [`AsezDate`]
@@ -22,7 +30,10 @@ pub const DATE_FORMAT: &str = "%d.%m.%Y";
 /// Формат, в котором реализован [`Display`] для [`AsezTimestamp`]
 pub const TIMESTAMP_FORMAT: &str = "%d.%m.%Y %H:%M:%S";
 
-/// This is a wrapper around date that implements default.
+/// Обёртка над [`sqlx::types::time::Date`] с реализацией `Default`.
+///
+/// Нужна для полей структур [`DbItem`], которые должны иметь дефолтное значение.
+/// Сериализуется как строка вида `"31.12.2024"`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AsezDate(pub Date);
 
@@ -42,6 +53,10 @@ impl AsezDate {
         self.0.weekday().number_days_from_monday()
     }
 
+    /// Возвращает ближайший следующий день недели `weekday` после этой даты.
+    ///
+    /// Если текущий день уже совпадает с `weekday`, возвращает следующую
+    /// неделю (через 7 дней), а не саму эту дату.
     pub fn with_next_weekday(&self, weekday: Weekday) -> Self {
         let maybe_days_to_next_weekday = (weekday.number_days_from_monday() + 7
             - self.number_days_from_monday())
@@ -59,10 +74,12 @@ impl AsezDate {
         )
     }
 
+    /// Проверяет, равна ли дата дефолтному значению (`1901-01-01`).
     pub fn is_empty(&self) -> bool {
         *self == AsezDate::default()
     }
 
+    /// Возвращает номер месяца или 0 для дефолтной даты.
     pub fn get_month(&self) -> u8 {
         if *self == AsezDate::default() {
             0
@@ -71,6 +88,7 @@ impl AsezDate {
         }
     }
 
+    /// Конвертирует дату в число Excel (дни с 01.01.1900 + 2 из-за бага Lotus 1-2-3).
     pub fn to_excel(&self) -> f64 {
         if *self == AsezDate::default() {
             return 0.0;
@@ -85,7 +103,7 @@ impl AsezDate {
         Self(Date::from_julian_day(julian_date))
     }
 
-    /// Считает количество рабочих дней от `self` до `end`, включая конечную дату.
+    /// Считает количество рабочих дней от `self` до `end`, включая обе граничные даты.
     pub fn working_days_between(&self, end: AsezDate) -> u16 {
         let start_date = self.0;
         let end_date = end.0;
@@ -118,10 +136,12 @@ impl AsezDate {
         (other.0 - self.0).whole_days()
     }
 
+    /// Конвертирует дату в `AsezTimestamp` с временем 00:00:00.
     pub fn to_timestamp(self) -> AsezTimestamp {
         AsezTimestamp(self.0.midnight())
     }
 
+    /// Сдвигает дату на `days` дней (через юлианский день).
     pub fn add_days(&self, days: i64) -> Self {
         let j = self.0.julian_day() + days;
         Self(Date::from_julian_day(j))
@@ -134,7 +154,7 @@ impl AsezDate {
             .map_err(|_| format!("{} не может быть валидной датой", value))
     }
 
-    /// Конвертация строки с форматом апи [`DATE`]
+    /// Конвертация строки с форматом апи [`DATE_FORMAT`]
     pub fn try_from_api_format(value: &str) -> Result<Self, String> {
         Date::parse(value, DATE_FORMAT)
             .map(AsezDate)
@@ -158,6 +178,8 @@ impl From<time::Date> for AsezDate {
 impl TryFrom<&str> for AsezDate {
     type Error = String;
 
+    /// Пробует разобрать строку как дату: сначала в API-формате (`DD.MM.YYYY`),
+    /// затем в формате БД (`YYYY-MM-DD`).
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         Self::try_from_api_format(value)
             .or_else(|_| Self::try_from_db_format(value))
@@ -176,6 +198,8 @@ impl From<AsezDate> for NaiveDate {
     }
 }
 
+/// Дефолтная "пустая" дата: `1901-01-01`.
+/// Совпадает с `NOT NULL DEFAULT '1901-01-01'` в схеме БД.
 impl Default for AsezDate {
     fn default() -> Self {
         AsezDate(Date::try_from_yo(1901, 1).expect("1901.01.01 is valid"))
@@ -210,6 +234,7 @@ impl Deref for AsezDate {
     }
 }
 
+/// Сериализуется как строка `"DD.MM.YYYY"`.
 impl Serialize for AsezDate {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -219,6 +244,7 @@ impl Serialize for AsezDate {
     }
 }
 
+/// Десериализуется из строки: поддерживает оба формата (API и БД).
 impl<'de> Deserialize<'de> for AsezDate {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -230,7 +256,11 @@ impl<'de> Deserialize<'de> for AsezDate {
     }
 }
 
-/// This is a wrapper around PrimitiveDateTime that implements default.
+/// Обёртка над [`sqlx::types::time::PrimitiveDateTime`] с реализацией `Default`.
+///
+/// Нужна по той же причине, что и [`AsezDate`].
+/// Сериализуется как Unix timestamp (секунды), десериализуется из него же --
+/// это удобнее для API, чем строки с часовым поясом.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AsezTimestamp(pub PrimitiveDateTime);
 
@@ -249,7 +279,11 @@ impl AsezTimestamp {
         AsezTimestamp(PrimitiveDateTime::new(t.date(), t.time()))
     }
 
-    /// Creates timestamp with us resolution (for compatibility with Postgres).
+    /// Текущее время с точностью до микросекунд.
+    ///
+    /// PostgreSQL хранит `timestamp` с точностью до мкс, поэтому при сравнении
+    /// с записанными значениями стандартный `now()` с наносекундами может
+    /// давать несоответствие.
     pub fn now_us() -> Self {
         let td = OffsetDateTime::now_utc();
         let t = td.time();
@@ -263,21 +297,22 @@ impl AsezTimestamp {
         AsezTimestamp(PrimitiveDateTime::new(td.date(), t))
     }
 
+    /// Возвращает дату по московскому времени (UTC+3).
     pub fn to_moscow_date(&self) -> AsezDate {
         AsezDate(self.0.assume_offset(UtcOffset::hours(3)).date())
     }
 
+    /// Конвертирует временную метку в московский часовой пояс (UTC+3).
     pub fn to_moscow_timestamp(&self) -> Self {
         let t = self.0.assume_utc().to_offset(UtcOffset::hours(3));
         AsezTimestamp(PrimitiveDateTime::new(t.date(), t.time()))
     }
 
-    /// Проверяет, является ли дата пустой.
+    /// Проверяет, является ли временная метка "пустой".
     ///
     /// В БД могут встречаться две "пустые" даты:
-    /// `(0,0,0)` – это настоящий `default`.
-    /// `1901-01-01` – это значение, установленное в таблицах БД,
-    /// например `NOT NULL DEFAULT '1901-01-01'`.
+    /// `(0,0,0)` -- настоящий `default` при нулевой инициализации.
+    /// `1901-01-01` -- значение, установленное в таблицах БД как `NOT NULL DEFAULT '1901-01-01'`.
     /// Проверяем оба случая, чтобы корректно обработать
     /// "пустые" даты независимо от их источника.
     pub fn is_empty(&self) -> bool {
@@ -285,6 +320,7 @@ impl AsezTimestamp {
         year_month_day == (0, 0, 0) || year_month_day == (1901, 1, 1)
     }
 
+    /// Возвращает максимально далёкую дату в будущем (9999-12-31).
     pub fn max() -> Self {
         let offset = OffsetDateTime::from_unix_timestamp(253_402_203_600);
         AsezTimestamp(PrimitiveDateTime::new(offset.date(), offset.time()))
@@ -292,14 +328,14 @@ impl AsezTimestamp {
 
     /// Возвращает дату в часовом поясе UTC+3.
     /// Метод предназначен для отображения данных в Excel,
-    /// не подходит для работы с БД
+    /// не подходит для работы с БД.
     pub fn date_offset_3(&self) -> AsezDate {
         AsezDate(self.0.assume_offset(UtcOffset::hours(3)).date())
     }
 
-    /// Форматирует timestamp в строку с часовым поясом UTC+3.
+    /// Форматирует временную метку в строку в часовом поясе UTC+3.
     /// Метод предназначен для отображения данных в Excel,
-    /// не подходит для работы с БД
+    /// не подходит для работы с БД.
     pub fn to_text_offset_3(&self) -> String {
         self.0
             .assume_utc()
@@ -307,14 +343,14 @@ impl AsezTimestamp {
             .format(TIMESTAMP_FORMAT)
     }
 
-    /// Конвертация строки с форматом таймстемпы БД [`DB_TIMESTAMP_FORMAT`]
+    /// Конвертация строки с форматом временной метки БД [`DB_TIMESTAMP_FORMAT`]
     pub fn try_from_db_format(value: &str) -> Result<Self, String> {
         PrimitiveDateTime::parse(value, DB_TIMESTAMP_FORMAT)
             .map(AsezTimestamp)
             .map_err(|_| format!("{} не может быть валидной датой", value))
     }
 
-    /// Конвертация строки с форматом таймстемпы апи [`TIMESTAMP_FORMAT`]
+    /// Конвертация строки с форматом временной метки апи [`TIMESTAMP_FORMAT`]
     pub fn try_from_api_format(value: &str) -> Result<Self, String> {
         PrimitiveDateTime::parse(value, TIMESTAMP_FORMAT)
             .map(AsezTimestamp)
@@ -325,6 +361,8 @@ impl AsezTimestamp {
 impl TryFrom<&str> for AsezTimestamp {
     type Error = String;
 
+    /// Пробует разобрать строку как временную метку: сначала API-формат,
+    /// затем формат БД.
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         Self::try_from_api_format(value)
             .or_else(|_| Self::try_from_db_format(value))
@@ -363,6 +401,7 @@ impl From<AsezTimestamp> for NaiveDateTime {
     }
 }
 
+/// Дефолтный "пустой" timestamp: `1901-01-01 00:00:00`.
 impl Default for AsezTimestamp {
     fn default() -> Self {
         let d = Date::try_from_yo(1901, 1).expect("1901.01.01 00:00:00 is valid");
@@ -402,6 +441,7 @@ impl Display for AsezTimestamp {
     }
 }
 
+/// Сериализуется как Unix timestamp (i64) для передачи через API.
 impl Serialize for AsezTimestamp {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -411,6 +451,7 @@ impl Serialize for AsezTimestamp {
     }
 }
 
+/// Десериализуется из Unix timestamp (i64).
 impl<'de> Deserialize<'de> for AsezTimestamp {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

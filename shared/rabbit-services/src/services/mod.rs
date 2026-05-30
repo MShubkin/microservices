@@ -1,45 +1,52 @@
-//! Cервисы АСЕЗ2, доступные для удаленных вызовов через RabbitMQ.
+//! Типизированные RPC-клиенты для сервисов АСЭЗ 2.0 через RabbitMQ.
 //!
-//! Каждый сервис содержит
-//! - Адаптер Rabbit
-//! - Идентификатор микросервиса-пользователя
-//! - Мета-информацию для вызова (`AsezRabbitProperties`)
+//! Каждый сервис хранит три вещи:
+//! - [`RabbitAdapter`] -- подключение к брокеру;
+//! - [`Source`] -- идентификатор вызывающего микросервиса (нужен для логирования);
+//! - [`AsezRabbitProperties`] -- метаданные запроса (заголовки трассировки).
 //!
-//! Для констуирования сервисов в коде, основанном на actix_web,
-//! каждый из них реализует [`FromRequest`](actix_web::FromRequest).
-//! Для корректной работы этой реализации в запросе должны быть доступны
-//! - адаптер Rabbit сервера, как `Arc<RabbitAdapter>`
-//! - идентификатор микросервиса-пользователя, например, `Source::EstimatedCommission`.
+//! RPC реализован через механизм Direct Reply-to: при каждом вызове
+//! `service_request` на канале временно регистрируется консьюмер на
+//! псевдоочередь `amq.rabbitmq.reply-to`. Брокер возвращает ответ в эту же
+//! псевдоочередь без создания реальной очереди, что исключает накопление мусора.
 //!
-//! Так же из запроса берется метаинформация в виде `AsezRabbitProperties` (в
-//! настоящее время -- только для логгирования). См. [../../../http-middleware/README.md].
+//! Чтобы сервис можно было получить прямо в Actix-хэндлере через аргумент функции,
+//! макрос `from_request!` генерирует реализацию [`FromRequest`](actix_web::FromRequest).
+//! Для этого в `App::new()` должны быть зарегистрированы два объекта:
+//! - `Arc<RabbitAdapter>` -- через `Data::from(config.rabbit_adapter())`;
+//! - `Source` -- идентификатор сервиса-хозяина, например `Source::EstimatedCommission`.
 //!
-//! Создание web-приложения:
+//! Пример регистрации:
 //! ```ignore
 //! App::new()
-//!     ...
 //!     .app_data(Source::EstimatedCommission)
 //!     .app_data(Data::from(config.rabbit_adapter()))
 //! ```
 //!
-//! Декларация хендлера запроса:
+//! Пример хэндлера:
 //! ```ignore
-//! fn service_handler(
-//!     ...
-//!     processing: ProcessingService
-//!     ...
-//! ) -> Result<...> {
-//!     ...
+//! async fn my_handler(processing: ProcessingService) -> Result<...> {
+//!     processing.call_something(...).await
 //! }
 //! ```
 
+/// Генерирует реализацию `actix_web::FromRequest` для указанного типа сервиса.
+///
+/// Форма `from_request!(Foo)` использует конструктор `Foo::new`.
+/// Форма `from_request!(Foo, custom_new)` позволяет указать другой конструктор.
+///
+/// Реализация извлекает из запроса:
+/// 1. `Arc<RabbitAdapter>` -- обязательно, иначе ошибка при старте хэндлера.
+/// 2. `Source` -- идентификатор вызывающего сервиса, обязательно.
+/// 3. `AsezRabbitProperties` -- метаданные трассировки; если отсутствуют, берётся `Default`.
+///    Затем в них дописываются поля `AsezTracingFieldsCollection`, если они есть в расширениях запроса.
 macro_rules! from_request {
     ($ty:ident) => {
         from_request!($ty, new);
     };
     ($ty:ident, $new:ident) => {
         impl actix_web::FromRequest for $ty {
-            type Error = Box<dyn std::error::Error + 'static>;
+            type Error = actix_web::Error;
 
             type Future =
                 std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self, Self::Error>>>>;
@@ -50,18 +57,33 @@ macro_rules! from_request {
             ) -> Self::Future {
                 let req = req.clone();
                 Box::pin(async move {
-
+                    // Отсутствие любой из требуемых вещей в `app_data` — это ошибка конфигурации
+                    // сервиса (забыли `.app_data(...)` в `App::new()`), а не клиентская ошибка.
+                    // Поэтому отдаём 500 без внутренней диагностики наружу, а причину пишем в лог.
                     let Some(rabbit_adapter) = req.app_data::<actix_web::web::Data<RabbitAdapter>>() else {
-                        return Err("не установлен адаптер кролика".into())
+                        tracing::error!(
+                            kind = "infra",
+                            service = stringify!($ty),
+                            "RabbitAdapter не зарегистрирован в App::app_data",
+                        );
+                        return Err(actix_web::error::ErrorInternalServerError("service unavailable"));
                     };
                     let Some(service_caller) = req.app_data::<shared_essential::presentation::dto::Source>().cloned() else {
-                        return Err("не установлен признак исходного сервиса".into())
+                        tracing::error!(
+                            kind = "infra",
+                            service = stringify!($ty),
+                            "Source (service_caller) не зарегистрирован в App::app_data",
+                        );
+                        return Err(actix_web::error::ErrorInternalServerError("service unavailable"));
                     };
                     use actix_web::HttpMessage;
+                    // AsezRabbitProperties может быть заполнен HTTP-middleware;
+                    // если его нет -- создаём дефолтный (персистентный JSON).
                     let mut rabbit_properties = req.extensions()
                         .get::<AsezRabbitProperties>()
                         .cloned()
                         .unwrap_or_default();
+                    // Дописываем поля трассировки, если middleware их положил в расширения запроса.
                     if let Some(fields) = req.extensions().get::<igg_tracing::tracing_fields::AsezTracingFieldsCollection>() {
                         rabbit_properties.add_tracing_fields(fields);
                     }
@@ -78,7 +100,7 @@ macro_rules! from_request {
 
 #[cfg(feature = "integration")]
 pub mod integration;
-/// Более или менее универсальный.
+/// Клиент для отправки записей в сервис хранения логов.
 pub mod log_storage;
 #[cfg(feature = "master-data")]
 pub mod master_data;
@@ -116,25 +138,29 @@ use crate::{
     routing::AsezRabbitRouting,
 };
 
+/// Трейт типизированного RPC-клиента к сервису АСЭЗ 2.0 через RabbitMQ.
+///
+/// Реализован на основе паттерна Direct Reply-to: вместо создания временной очереди
+/// используется псевдоочередь `amq.rabbitmq.reply-to`. Брокер сам возвращает ответ
+/// на канал, который отправил запрос, не создавая никаких реальных очередей.
+///
+/// Каждый вызов `service_request` регистрирует временный консьюмер с уникальным тегом,
+/// ждёт ответа с заданным таймаутом и снимает консьюмера. Параллельные вызовы
+/// не мешают друг другу, так как теги уникальны (UUID-суффикс).
+///
+/// Конкретные сервисы (MasterDataService, ProcessingService и т.д.) реализуют
+/// этот трейт и добавляют типизированные методы поверх `service_request`.
 #[async_trait]
 pub trait AsezRabbitService {
-    /// Наименование сервиса
+    /// Константа с идентификатором целевого сервиса.
     const SERVICE: Source;
 
-    /// # Описание
+    /// Выполняет типизированный RPC-вызов к удалённому сервису.
     ///
-    /// Обращение к сервису АСЭЗ 2.0 по AMQP, используя RabbitMQ.
-    /// Определяет общее использование RPC паттерна
-    ///
-    /// # Аргументы
-    /// * `dto` - Отправляемое другому сервису тело сообщения
-    /// * `routing_key` - Очередь, куда будет отправлено сообщение
-    /// * `basic_props` - Базовые свойства взаимодействия с RabbitMQ
-    /// * `timeout` - Таймаут, по истечении которого запрос будет принудительно закончен
-    ///
-    /// # Возвращает
-    /// * Ok([`RabbitMessage<AsezResult<R>>`]) - Успешное получение ответа от сервиса
-    /// * Err([`BrokerError`]) - Что-то пошло не так при отправке или получении сообщения
+    /// Сериализует `dto` в JSON, публикует в очередь `routing_key`,
+    /// подписывается на `amq.rabbitmq.reply-to` и ждёт ответа не дольше `timeout`.
+    /// Ответ приходит в виде `RabbitMessage<AsezResult<R>>` -- обёртка содержит
+    /// свойства ответного сообщения и уже десериализованный результат.
     async fn service_request<T, R>(
         &self,
         dto: T,
@@ -151,18 +177,11 @@ pub trait AsezRabbitService {
         direct_reply.request(&dto, timeout).await
     }
 
-    /// # Описание
+    /// Настраивает механизм Direct Reply-to перед отправкой запроса.
     ///
-    /// Настройка Direct-Reply механизма для RPC паттерна при
-    /// испрользовании RabbitMQ
-    ///
-    /// # Аргументы
-    /// * `routing_key` - Отправляемое другому сервису тело сообщения
-    /// * `basic_props` - Базовые свойства взаимодействия с RabbitMQ
-    ///
-    /// # Возвращает
-    /// * Ok([`DirectReply`]) - Успешная регистрация Direct-Reply механизма
-    /// * Err([`BrokerError`]) - Что-то пошло не так при регистрации консьюмера или паблишера
+    /// Регистрирует паблишер и консьюмер на `amq.rabbitmq.reply-to`, затем
+    /// подключает все заданные коллбэки (например, [`LogStorageCallback`]).
+    /// Вызывается внутри `service_request` -- использовать напрямую не нужно.
     async fn setup_direct_reply(
         &self,
         routing_key: AsezRabbitRouting,
@@ -181,7 +200,7 @@ pub trait AsezRabbitService {
         Ok(direct_reply)
     }
 
-    /// Регистрация коллбэков
+    /// Подключает все зарегистрированные коллбэки к экземпляру DirectReply.
     fn register_callbacks(&self, direct_reply: &mut DirectReply) {
         for callback in self.callbacks() {
             match callback {
@@ -193,14 +212,16 @@ pub trait AsezRabbitService {
         }
     }
 
-    /// Базовые свойства для отправки AMQP сообщений в RabbitMQ
+    /// Строит аргументы публикации из маршрута: extract exchange + queue и оборачивает в `BasicPublishArguments`.
     fn basic_publish_args(routing_key: AsezRabbitRouting) -> BasicPublishArguments {
         let (exchange, routing_key) = routing_key.as_full_routing();
         BasicPublishArguments::new(exchange, routing_key)
     }
 
-    /// Создание консьюмер тэга для идентификации консьюмера.
-    /// Тэг создается в формате `{ВЫЗЫВАЮЩИЙ_СЕРВИС}-{ВЫЗЫВАЕМЫЙ СЕРВИС}-consumer-{UUID}`
+    /// Формирует уникальный тег консьюмера вида `{caller}<-{service}-consumer-{uuid}`.
+    ///
+    /// UUID-суффикс гарантирует, что одновременные RPC-вызовы одного и того же
+    /// сервиса не перехватят чужие ответы.
     fn consumer_tag(&self) -> String {
         format!(
             "{}<-{}-consumer-{}",
@@ -210,21 +231,19 @@ pub trait AsezRabbitService {
         )
     }
 
-    /// Определение того, кто вызывает имплементируемый сервис
+    /// Возвращает идентификатор вызывающего сервиса (нужен для логирования и тега консьюмера).
     fn service_caller(&self) -> Source;
 
-    /// Получение [`RabbitAdapter`] для взаимодействия с имплементируемым
-    /// сервисом
+    /// Возвращает ссылку на адаптер RabbitMQ.
     fn adapter(&self) -> &RabbitAdapter;
 
-    /// Список коллбэков, которые должен регистрировать сервис
-    /// при каждом запросе
+    /// Возвращает список коллбэков, регистрируемых при каждом запросе.
     fn callbacks(&self) -> &[AsezCallback];
 
-    /// Сеттер коллбэка
+    /// Добавляет коллбэк к сервису (builder-паттерн).
     fn with_callback(self, callback: AsezCallback) -> Self;
 
-    /// Сеттер [`LogStorageCallback`] коллбэка
+    /// Добавляет [`LogStorageCallback`] -- автоматически логирует каждую публикацию.
     fn with_log_callback(self) -> Self
     where
         Self: Sized,

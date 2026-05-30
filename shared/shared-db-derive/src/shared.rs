@@ -2,8 +2,11 @@ use proc_macro2::{Ident, Span, TokenStream};
 use syn::*;
 use syn::{Attribute, Meta};
 
-/// This function dumps all attributes with the exception of `#[adaptor_derive(Stuff)]`,
-/// which it renames to `#[derive(Stuff)]`
+/// Ищет атрибут с именем `attr_name` в формате `#[adaptor_derive(X, Y)]` и
+/// переименовывает его путь в `derive`, чтобы получился `#[derive(X, Y)]`.
+///
+/// Если атрибут не найден -- возвращает пустой список. Нужно для того, чтобы
+/// адаптор мог унаследовать дополнительные derive-трейты от исходной структуры.
 pub(super) fn retain_attributes(
     inp_attrs: &[Attribute],
     attr_name: &str,
@@ -23,9 +26,12 @@ pub(super) fn retain_attributes(
         .unwrap_or_default()
 }
 
-/// Finds the attribute with the `default_kind` name and offers it as the new
-/// `Type` for the field. If not, it will use the default type (the original)
-/// type of the attribute usually.
+/// Возвращает тип поля для адаптора.
+///
+/// Если поле помечено `#[adaptor_type = "NewType"]`, возвращает
+/// `Option<NewType>`. Иначе возвращает `Option<OriginalType>`.
+/// `Option` нужен потому что все поля адаптора опциональны -- `None` означает
+/// "поле не затронуто при обновлении".
 pub(super) fn retype(
     inp_attrs: &[Attribute],
     rename_kind: &str,
@@ -50,8 +56,10 @@ pub(super) fn retype(
         })
 }
 
-/// Essentially retrieves the string literal from a `key = "value"` kind
-/// of attribute and extracts it as an identity.
+/// Извлекает строковой литерал из атрибута вида `#[attr_name = "value"]`
+/// и возвращает его как [`Ident`].
+///
+/// Используется для получения имён функций и типов из атрибутов proc-macro.
 pub(super) fn get_attr_ident(
     inp_attrs: &[Attribute],
     attr_ident: &str,
@@ -69,8 +77,11 @@ pub(super) fn get_attr_ident(
     })
 }
 
-/// Essentially retrieves the string literal from a `key = "value"` kind
-/// of attribute and extracts it as an expression.
+/// Извлекает строковой литерал из атрибута вида `#[attr_name = "expr"]`
+/// и парсит его как выражение Rust.
+///
+/// Используется для `item_field_activate_with` и аналогичных атрибутов,
+/// где значение -- произвольное выражение типа `chrono::Utc::now()`.
 pub(super) fn get_attr_expr(
     inp_attrs: &[Attribute],
     attr_ident: &str,
@@ -90,7 +101,10 @@ pub(super) fn get_attr_expr(
     })
 }
 
-/// Renames an entity based on the attributes.
+/// Возвращает имя сущности (struct/field) с учётом атрибута переименования.
+///
+/// Если атрибут `rename_kind` задан -- используется его значение как `Ident`.
+/// Иначе возвращается `default_name`.
 pub(super) fn rename(
     inp_attrs: &[Attribute],
     rename_kind: &str,
@@ -99,6 +113,7 @@ pub(super) fn rename(
     get_attr_ident(inp_attrs, rename_kind).unwrap_or(default_name.to_owned())
 }
 
+/// Находит атрибут вида `#[name = value]` и возвращает пару `name = value`.
 pub(super) fn find_name_value_attr(
     inp_attrs: &[Attribute],
     name: &str,
@@ -109,15 +124,19 @@ pub(super) fn find_name_value_attr(
     })
 }
 
+/// Проверяет наличие атрибута-маркера (`#[name]`) среди атрибутов.
 pub(super) fn has_attr(inp_attrs: &[Attribute], name: &str) -> bool {
     inp_attrs.iter().any(|x| x.path().is_ident(name))
 }
 
+/// Извлекает типы всех полей структуры.
 pub(super) fn extract_field_types(fields: &[Field]) -> Vec<Type> {
     fields.iter().map(|x| x.ty.to_owned()).collect::<Vec<_>>()
 }
 
-/// This is a simple convenience function.
+/// Фильтрует поля: возвращает только те, у которых нет ни одного из
+/// перечисленных атрибутов. Используется для исключения autogen-полей
+/// из списка INSERT_FIELDS.
 pub(super) fn find_fields_without<'a>(
     fields: &'a [Field],
     exclude_attrs: &'a [&'a str],
@@ -129,7 +148,7 @@ pub(super) fn find_fields_without<'a>(
     })
 }
 
-/// This is a simple convenience function.
+/// Возвращает поля с указанным атрибутом (без индекса).
 pub(super) fn find_fields_with<'a>(
     fields: &'a [Field],
     attr: &'a str,
@@ -137,7 +156,9 @@ pub(super) fn find_fields_with<'a>(
     find_idx_fields_with(fields, attr).map(|(_, x)| x)
 }
 
-/// This is a simple convenience function.
+/// Возвращает пары `(индекс, поле)` для полей с указанным атрибутом.
+///
+/// Индекс нужен для генерации `PRIMARY_KEY_INDICES` и `NO_UPDATE_INDICES`.
 pub(super) fn find_idx_fields_with<'a>(
     fields: &'a [Field],
     attr: &'a str,
@@ -148,6 +169,8 @@ pub(super) fn find_idx_fields_with<'a>(
         .filter(|(_, x)| x.attrs.iter().any(|x| x.path().is_ident(attr)))
 }
 
+/// Получает данные структуры из `DeriveInput` с паникой при попытке применить
+/// макрос к enum или union.
 pub(super) fn get_struct<'a>(
     inp: &'a DeriveInput,
     module: &str,
@@ -168,6 +191,10 @@ pub(super) fn get_struct<'a>(
     }
 }
 
+/// Получает именованные поля структуры.
+///
+/// Паникует для структур с безымянными полями или unit-структур, так как
+/// они не могут отображаться на именованные колонки БД.
 pub(super) fn get_named_fields(
     inp: &syn::DataStruct,
     module: &str,
@@ -178,17 +205,12 @@ pub(super) fn get_named_fields(
             "`{module}` does not deal with unnamed fields or unit structs.",
             module = module
         ),
-        // NB: We can also process other kinds of fields, but this would only lead
-        // to problems since we are inserting *named* fields into *named* database
-        // table columns.
-        // Fields::Unnamed(FieldsUnnamed { unnamed: x, .. }) => x.to_owned(),
-        // Fields::Unit => Punctuated::new(),
     }
     .into_iter()
     .collect::<Vec<_>>()
 }
 
-/// Получение всех вариантов енама с атрибутом
+/// Возвращает варианты enum с указанным атрибутом.
 pub(super) fn find_variants_with<'a>(
     variants: impl IntoIterator<Item = &'a Variant>,
     attr: &'a str,

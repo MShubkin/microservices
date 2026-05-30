@@ -1,3 +1,4 @@
+//! Клиент RabbitMQ для сервиса интеграции (SAP PI и хранение документов OpenText).
 use std::{sync::Arc, time::Duration};
 
 use broker::rabbit::RabbitAdapter;

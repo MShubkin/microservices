@@ -11,8 +11,16 @@ use actix_web::{
 use futures::future::LocalBoxFuture;
 use igg_tracing::tracing_fields::AsezTracingFieldsCollection;
 
-/// Middleware that injects AsezTracingFieldsCollection
-/// for collecting common request fields for tracing in other services.
+/// Middleware, которая создаёт `AsezTracingFieldsCollection` из входящего HTTP-запроса.
+///
+/// Коллекция полей — общий контейнер для трассировки, который путешествует через весь
+/// запрос: сначала его читает `ServiceRootSpanBuilder` для span-атрибутов, затем
+/// `AsezSessionWatcher` дополняет `user_id`/`user_name`, `DomainIDsTransform` —
+/// `object_ids`/`object_uuids`. В конце вся коллекция уходит в RabbitMQ-заголовки.
+///
+/// IP-адрес читается через `realip_remote_addr()` — это заголовок `X-Forwarded-For`,
+/// который выставляет балансировщик. Если заголовок отсутствует или нечитаем,
+/// фолбэк — `0.0.0.0:0`: лучше потерять IP, чем завалить запрос.
 pub struct AsezTracingFields;
 
 impl<S, B> Transform<S, ServiceRequest> for AsezTracingFields
@@ -34,7 +42,7 @@ where
     }
 }
 
-/// Service that injects instance of fields collection into the request.
+/// Фактическая реализация middleware.
 pub struct AsezTracingFieldsService<S> {
     service: S,
 }

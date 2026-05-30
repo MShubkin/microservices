@@ -1,4 +1,14 @@
-//! This module contains the CEF format relevant code.
+//! CEF (Common Event Format) — слой трейсинга для SIEM-систем.
+//!
+//! Каждое событие сериализуется в одну строку вида:
+//! ```text
+//! May 11 12:00:00 192.168.1.1 CEF:0|Vendor|Name|1.0|category|event_id|severity|key=val ...
+//! ├─────────────┘ └─────────┘ └──┘ └────────────────────────────────┘ └──────┘ └───────┘
+//!   timestamp      host ip    ver        7 заголовочных полей (pipe)    sev.   extension
+//! ```
+//!
+//! Запись в файл/stdout происходит через `tracing_appender::NonBlocking` —
+//! асинхронный writer, не блокирующий рабочий поток Tokio.
 use time::{OffsetDateTime, UtcOffset};
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
@@ -17,42 +27,57 @@ use std::path::Path;
 
 use super::{event_severity, ReqBaseData, ServiceDescription};
 
-/// This structure stores the non blocking writer and the variables which will
-/// likely remain constant across writes.
+/// Слой `tracing_subscriber`, записывающий события в формате CEF.
+///
+/// Конструируется через `ServiceDescription::into_guarded_cef_layer_file` или
+/// `into_guarded_cef_layer_stdout`. Возвращаемый `WorkerGuard` **должен жить
+/// до конца программы** — его drop сигнализирует фоновому потоку прекратить
+/// запись, что ведёт к потере буферизованных логов.
+///
+/// Слой фильтрует события по полю `kind`: логируются только события, у которых
+/// `kind` входит в срез `kinds`. Пустой `kinds` означает «логировать всё».
 #[derive(Debug, Clone)]
 pub struct CEFTracingLayer<'a> {
-    /// This writer should allow the writing of regularly "rolling"/"rotating"
-    /// log files without blocking the thread.
+    /// Non-blocking writer — запись делегируется фоновому потоку, не блокируя async executor.
     writer: AppenderNonBlocking,
     host: net::IpAddr,
     srv_vendor: String,
     srv_name: String,
     srv_version: String,
-    /// Is there a better way of storing these?
+    /// Whitelist категорий событий (поле `kind`). Пустой срез = логировать всё.
     kinds: &'a [&'a str],
-    /// This represents the timezone GMT +/- tz (hours).
-    /// We assume that we're tracing in Moscow/Leningrad, but the country has 11
-    /// timezones.
+    /// Часовой пояс для timestamp в CEF-строке. Дефолт — Москва (UTC+3).
     tz: UtcOffset,
 }
 
+/// Временный аккумулятор данных одного `tracing::Event` для CEF-записи.
+///
+/// Заполняется через `Visit::record_str` / `record_debug` при обходе полей события.
+/// После заполнения `is_traceable` определяет, нужно ли писать в лог.
 #[derive(Debug, Clone, Default)]
 pub struct CEFVisitorEvent<'a> {
+    /// Whitelist из родительского `CEFTracingLayer` — нужен для проверки `kind`.
     kinds: &'a [&'a str],
+    /// Становится `true`, когда встречено поле `kind` со значением из `kinds`.
+    /// Инициализируется `kinds.is_empty()`: пустой список = логировать всё.
     is_traceable: bool,
+    /// CEF-поле `Name` (event_id) — заполняется из поля `id` или `message`.
     id: String,
+    /// Дополнительные key=value пары для CEF Extension.
     ext: String,
+    /// Код пользователя из поля `suser` — переопределяет `user_code` из span.
     user_code: Option<String>,
 }
 
 impl ServiceDescription {
-    /// NB: Quoting the documentation:
+    /// Создаёт CEF-слой с записью в файл.
     ///
-    /// Note that the WorkerGuard returned by non_blocking must be assigned to
-    /// a binding that is not _, as _ will result in the WorkerGuard being
-    /// dropped immediately. Unintentional drops of WorkerGuard remove the
-    /// guarantee that logs will be flushed during a program’s termination,
-    /// in a panic or otherwise.
+    /// Файл открывается в режиме append (дозапись) и создаётся, если не существует.
+    /// Это позволяет безопасно ротировать файлы внешними инструментами (logrotate).
+    ///
+    /// **Важно**: `WorkerGuard` необходимо сохранить в переменную (не `_`).
+    /// Если guard будет дропнут сразу, фоновый поток записи завершится,
+    /// и часть буферизованных логов может быть потеряна — в том числе при панике.
     pub fn into_guarded_cef_layer_file<'a>(
         self,
         path: impl AsRef<Path>,
@@ -79,13 +104,10 @@ impl ServiceDescription {
         (layer, guard)
     }
 
-    /// NB: Quoting the documentation:
+    /// Создаёт CEF-слой с записью в stdout.
     ///
-    /// Note that the WorkerGuard returned by non_blocking must be assigned to
-    /// a binding that is not _, as _ will result in the WorkerGuard being
-    /// dropped immediately. Unintentional drops of WorkerGuard remove the
-    /// guarantee that logs will be flushed during a program’s termination,
-    /// in a panic or otherwise.
+    /// Используется в контейнерных окружениях, где логи собираются со stdout.
+    /// Те же требования к `WorkerGuard`, что и у `into_guarded_cef_layer_file`.
     pub fn into_guarded_cef_layer_stdout<'a>(
         self,
         kinds: &'a [&'a str],
@@ -110,6 +132,8 @@ impl<'a> CEFVisitorEvent<'a> {
     pub(crate) fn new(kinds: &'a [&'a str]) -> Self {
         Self {
             kinds,
+            // Если список kinds пуст — сразу помечаем событие как traceable,
+            // иначе ждём поле `kind` со значением из whitelist.
             is_traceable: kinds.is_empty(),
             id: String::with_capacity(24),
             ext: String::with_capacity(255),
@@ -118,24 +142,28 @@ impl<'a> CEFVisitorEvent<'a> {
     }
 }
 
+/// Обход полей одного `tracing::Event` для заполнения CEF-аккумулятора.
 impl<'a> Visit for CEFVisitorEvent<'a> {
     fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
         match field.name() {
-            // `id` extension has higher priority than `message`
+            // Поле `id` имеет приоритет над `message` для CEF Name-поля.
+            // `message` используется как fallback, только если `id` ещё не задан.
             "message" if self.id.is_empty() => self.id = format!("{:?}", value),
             _ => self.ext.push_str(&format!("{}={:?}", field.name(), value)),
         }
     }
 
-    // Overloading the `record_str` method.
     fn record_str(&mut self, field: &Field, v: &str) {
         let fname = field.name();
         match fname {
-            // for siem logging, we log everything, so use empty kinds list
+            // Поле `kind` — фильтр: событие логируется только если его категория
+            // входит в whitelist. Пустой kinds уже обработан в `new()`.
             "kind" if self.kinds.is_empty() || self.kinds.contains(&v) => {
                 self.is_traceable = true
             }
+            // `suser` — код пользователя прямо в событии (переопределяет span-данные).
             "suser" => self.user_code = Some(v.to_owned()),
+            // `id` → CEF Name field (event identifier).
             "id" => self.id = v.to_owned(),
             _ => self.ext.push_str(&format!("{}={}", fname, v)),
         }
@@ -143,10 +171,16 @@ impl<'a> Visit for CEFVisitorEvent<'a> {
 }
 
 impl<'a> CEFTracingLayer<'a> {
-    /// This is the only CEF specific format part of the code. We can quite
-    /// easily write in other formats by adding a format switch to `CEFTracingLayer`
-    /// (and maybe rename it to `IGGTracingLayer`) and several `write_event_as_X`
-    /// functions.
+    /// Форматирует и записывает одну CEF-строку в non-blocking writer.
+    ///
+    /// Структура CEF-строки:
+    /// ```text
+    /// <timestamp> <host> CEF:0|<vendor>|<name>|<ver>|<cat>|<id>|<sev>|<extension>
+    /// ```
+    /// где extension = `suser=... src=... spt=... request=... requestClientApplication=... dpid=...`
+    ///
+    /// Ошибки записи игнорируются намеренно: нет безопасного способа обработать
+    /// их в контексте `tracing::Layer` без риска рекурсии или паники.
     pub(crate) fn write_event(
         &self,
         event: &CEFVisitorEvent<'_>,
@@ -162,6 +196,7 @@ impl<'a> CEFTracingLayer<'a> {
             .format(&time_format)
             .expect("Time should be valid.");
 
+        // Приоритет user_code: поле `suser` события > поле из span > "unknown".
         let user_code = event.user_code.as_ref().map_or_else(
             || {
                 if data.user_code.is_empty() {
@@ -204,20 +239,27 @@ impl<'a> CEFTracingLayer<'a> {
     }
 }
 
+/// Реализация `Layer` позволяет CEFTracingLayer встроиться в цепочку
+/// `tracing_subscriber` рядом с другими слоями (fmt, json, opentelemetry).
+///
+/// Требует `'static` lifetime, потому что `tracing_subscriber` хранит слои
+/// в `Arc<dyn Layer>` — компилятор не может гарантировать, что `'a` живёт
+/// достаточно долго. На практике `kinds` живёт в статической памяти программы.
 impl<S> tracing_subscriber::Layer<S> for CEFTracingLayer<'static>
 where
     S: Subscriber + for<'c> LookupSpan<'c>,
 {
-    /// We check for fields named "user_code", and if at least one exists we
-    /// extend the extensions.
-    /// TODO: Ask Maxim about why we are doing this.
+    /// Сохраняет `ReqBaseData` в extensions нового span-а, если у него есть поле `user_code`.
+    ///
+    /// Это позволяет дочерним событиям (вызовам `tracing::info!` внутри span-а)
+    /// унаследовать контекст HTTP-запроса без явной передачи через аргументы.
+    /// Если `ReqBaseData` уже существует в extensions (вложенные span-ы),
+    /// данные дополняются, а не перезаписываются.
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
         if attrs.fields().iter().any(|f| f.name() == "user_code") {
-            // TODO: Should this be done in a way that does not crash the tracer?
             let span = ctx.span(id).expect("Id cannot be wrong somehow?");
 
             let mut exts = span.extensions_mut();
-            // The borrowed base data is what is updated and stored in extensions.
             if let Some(base_data) = exts.get_mut::<ReqBaseData>() {
                 attrs.values().record(base_data);
             } else {
@@ -228,11 +270,13 @@ where
         }
     }
 
-    /// Specifically do nothing!
+    /// CEF-слой не использует момент входа в span — только события.
     fn on_enter(&self, _id: &Id, _ctx: Context<'_, S>) {}
 
+    /// Обрабатывает `span.record(field, value)` — обновляет `ReqBaseData` в extensions
+    /// при динамическом обновлении полей span-а (например, когда middleware
+    /// дописывает `user_id` уже после создания span-а).
     fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
-        // TODO: Should this be done in a way that does not crash the tracer?
         let span = ctx.span(id).expect("Id cannot be wrong somehow?");
 
         if let Some(base_data) = span.extensions_mut().get_mut::<ReqBaseData>() {
@@ -240,12 +284,20 @@ where
         };
     }
 
+    /// Основная точка вывода: вызывается для каждого `tracing::info!/warn!/error!`.
+    ///
+    /// Алгоритм:
+    /// 1. Собрать поля события в `CEFVisitorEvent`
+    /// 2. Проверить `is_traceable` — если `kind` не в whitelist, выйти
+    /// 3. Найти `ReqBaseData` в ближайшем родительском span-е (обход по scope)
+    /// 4. Записать CEF-строку. Если span не найден — записать с пустым `ReqBaseData`
+    ///    (событие без контекста запроса — например, логи при старте сервиса).
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let mut visitor_event = CEFVisitorEvent::new(self.kinds);
 
+        // Сначала нужно обойти все поля, только потом проверять is_traceable —
+        // поле `kind` может быть не первым в списке полей события.
         event.record(&mut visitor_event);
-        // NB: We must observe/record whether the event is traceable before we can
-        // decide whether we need to return or not.
         if !visitor_event.is_traceable {
             return;
         }
@@ -259,19 +311,31 @@ where
                 }
             }
         }
-        // If we have not returned after writing an event, we write a blank.
-        // NB: If we want to add format flexibility, we can get away by adding
-        // a switch here and some more `write_event_as_X` functions.
+        // Событие вне span-а (например, инфраструктурное при старте) —
+        // пишем с пустым контекстом, не теряя само сообщение.
         self.write_event(&visitor_event, &ReqBaseData::default(), level);
     }
 }
 
+/// Контекст экранирования: правила разные для заголовка и extension CEF-строки.
 #[derive(Copy, Clone)]
 enum CEFContext {
+    /// В заголовке полями-разделителями являются `|` — их нужно экранировать.
     Header,
+    /// В extension парами являются `key=value` — нужно экранировать `=`.
     Extension,
 }
 
+/// Экранирует специальные символы CEF согласно спецификации ArcSight.
+///
+/// Правила, общие для обоих контекстов:
+/// - `\` → `\\`
+/// - `\n` → `\n` (литерал)
+/// - `\r` → `\r` (литерал)
+///
+/// Контекст-специфичные правила:
+/// - Header: `|` → `\|` (разделитель полей заголовка)
+/// - Extension: `=` → `\=` (разделитель ключ-значение)
 fn escape_cef_value(value: &str, context: CEFContext) -> String {
     let mut escaped = String::with_capacity(value.len());
     for c in value.chars() {
@@ -279,7 +343,6 @@ fn escape_cef_value(value: &str, context: CEFContext) -> String {
             '\\' => escaped.push_str("\\\\"),
             '\n' => escaped.push_str("\\n"),
             '\r' => escaped.push_str("\\r"),
-
             '|' if matches!(context, CEFContext::Header) => escaped.push_str("\\|"),
             '=' if matches!(context, CEFContext::Extension) => {
                 escaped.push_str("\\=")

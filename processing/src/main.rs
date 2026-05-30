@@ -26,7 +26,7 @@ fn main() -> Result<()> {
 
     println!("Initialising Processing with {} async threads...", num_threads);
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(num_threads as usize)
+        .worker_threads(usize::from(num_threads))
         .enable_all()
         .build()?
         .block_on(inner_main(config))
@@ -41,7 +41,10 @@ pub(crate) async fn inner_main(cfg: infra::ProcessingConfig) -> Result<()> {
 
     let queues = infra::QueueSpec::default_queues();
 
-    tracing::info!("Initializing Processing with cfg: {:?}", cfg);
+    // Полная структура cfg более не логируется: даже с redacted-Debug это утечка
+    // топологии (хосты, порты, лимиты) в SIEM. Конкретные поля логируются по месту,
+    // где они используются.
+    tracing::info!(kind = "infra", "Processing config loaded");
     println!("About to launch Processing service loop.");
 
     // NB: Selecting between either process here means that the whole service

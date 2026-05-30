@@ -1,3 +1,14 @@
+//! Метаданные AMQP-сообщений: пользовательские заголовки и поля трассировки.
+//!
+//! [`AsezRabbitProperties`] -- обёртка над [`BasicProperties`] из `amqprs`.
+//! Хранит заголовки отдельно и добавляет их в `BasicProperties` только в момент
+//! финализации (`finish()`), потому что `amqprs` не позволяет изменять заголовки
+//! после создания свойств.
+//!
+//! Поля трассировки из HTTP-запроса (request_id, source IP, user_agent и т.д.)
+//! прокидываются в AMQP-заголовки, чтобы принимающий сервис мог продолжить
+//! распределённый трейс без разрыва. Обратный путь -- `basic_properties_to_tracing_fields`.
+
 use std::{net::AddrParseError, num::ParseIntError};
 
 use amqprs::{BasicProperties, FieldTable, FieldValue, LongStr, ShortStr};
@@ -6,14 +17,19 @@ use time::OffsetDateTime;
 use tracing::Span;
 use uuid::Uuid;
 
-// Хедеры запроса
-/// Хедер с айди пользователя, который инициировал запрос
+// Пользовательские заголовки запроса
+
+/// Заголовок с идентификатором пользователя, инициировавшего запрос.
 pub const REQUEST_USER_ID_HEADER: &str = "request_user_id";
-/// Хедер с айди запроса в системе
+/// Заголовок с уникальным идентификатором запроса внутри системы.
 pub const REQUEST_ID_HEADER: &str = "request_id";
 
-/// Базовые свойства для взаимодействия с RabbitMQ
-/// в рамказ АСЭЗ 2.0
+/// Свойства AMQP-сообщения для взаимодействия с сервисами АСЭЗ 2.0.
+///
+/// Заголовки накапливаются в отдельной [`FieldTable`] и вставляются в
+/// [`BasicProperties`] только при вызове [`finish()`](AsezRabbitProperties::finish).
+/// Это необходимо, потому что `amqprs` не предоставляет мутабельный доступ
+/// к заголовкам уже построенного объекта.
 #[derive(Debug, Clone)]
 pub struct AsezRabbitProperties {
     basic_props: BasicProperties,
@@ -21,6 +37,7 @@ pub struct AsezRabbitProperties {
 }
 
 impl AsezRabbitProperties {
+    /// Создаёт обёртку из готовых [`BasicProperties`] с пустой таблицей заголовков.
     pub fn new(basic_props: BasicProperties) -> Self {
         Self {
             basic_props,
@@ -28,13 +45,13 @@ impl AsezRabbitProperties {
         }
     }
 
-    /// Сеттер хедера [`REQUEST_USER_ID_HEADER`]
+    /// Добавляет заголовок с id пользователя (builder-вариант).
     pub fn with_user_id(mut self, user_id: i32) -> Self {
         self.set_user_id(user_id);
         self
     }
 
-    /// Сеттер хедера [`REQUEST_USER_ID_HEADER`]
+    /// Добавляет заголовок с id пользователя (мутабельный вариант).
     pub fn set_user_id(&mut self, user_id: i32) {
         self.headers.insert(
             ShortStr::try_from(REQUEST_USER_ID_HEADER)
@@ -48,7 +65,7 @@ impl AsezRabbitProperties {
         );
     }
 
-    /// Сеттер хедера [`REQUEST_ID_HEADER`]
+    /// Добавляет заголовок с идентификатором запроса (UUID).
     pub fn with_request_id(mut self, request_id: Uuid) -> Self {
         self.headers.insert(
             ShortStr::try_from(REQUEST_ID_HEADER)
@@ -61,7 +78,7 @@ impl AsezRabbitProperties {
         self
     }
 
-    /// Геттер хедера [`REQUEST_USER_ID_HEADER`]
+    /// Возвращает id пользователя из заголовков (строкой, как хранится в AMQP).
     pub fn user_id(&self) -> Option<&str> {
         let user_id = self.headers.get(
             &ShortStr::try_from(REQUEST_USER_ID_HEADER)
@@ -73,7 +90,7 @@ impl AsezRabbitProperties {
         }
     }
 
-    /// Геттер хедера [`REQUEST_ID_HEADER`]
+    /// Возвращает id запроса из заголовков, парсит UUID на месте.
     pub fn request_id(&self) -> Option<Uuid> {
         let request_id = self.headers.get(
             &ShortStr::try_from(REQUEST_ID_HEADER)
@@ -85,8 +102,12 @@ impl AsezRabbitProperties {
         }
     }
 
-    /// Добавляет поля для трассировки для передачи через адаптер
-    /// вызываемому серверу.
+    /// Сериализует поля распределённой трассировки в AMQP-заголовки.
+    ///
+    /// Вызывается перед публикацией, чтобы принимающий сервис мог восстановить
+    /// контекст трейса из входящего сообщения через `basic_properties_to_tracing_fields`.
+    /// Числовые поля (порт, таймстемп) хранятся как строки, кроме `TIMESTAMP`,
+    /// который пишется как AMQP timestamp (`FieldValue::T`).
     pub fn add_tracing_fields(&mut self, fields: &AsezTracingFieldsCollection) {
         self.headers.insert(
             field_short_str(REQUEST_ID),
@@ -123,18 +144,26 @@ impl AsezRabbitProperties {
                 fields.object_uuids.to_string().into(),
             );
         }
-        self.headers.insert(
-            field_short_str(TIMESTAMP),
-            FieldValue::T(fields.timestamp.unix_timestamp() as u64),
-        );
+        // AMQP timestamp хранится как u64 (FieldValue::T). Отрицательные значения
+        // (даты до 1970) физически невозможны для валидного OffsetDateTime::now_utc(),
+        // но защитимся от silent corruption при clipping.
+        let ts_secs = u64::try_from(fields.timestamp.unix_timestamp()).unwrap_or(0);
+        self.headers.insert(field_short_str(TIMESTAMP), FieldValue::T(ts_secs));
     }
 
+    /// Перекладывает накопленные заголовки в [`BasicProperties`] и возвращает готовый объект.
+    ///
+    /// После вызова `AsezRabbitProperties` потребляется: заголовки переданы брокеру.
     pub fn finish(mut self) -> BasicProperties {
         self.basic_props.with_headers(self.headers);
         self.basic_props
     }
 }
 
+/// Ошибки при разборе полей трассировки из AMQP-заголовков.
+///
+/// Возникают в `basic_properties_to_tracing_fields`, когда входящее сообщение
+/// содержит некорректные или нечитаемые заголовки трассировки.
 #[derive(Debug, thiserror::Error)]
 pub enum TracingPropertiesError {
     #[error("Нет обязательных полей")]
@@ -153,11 +182,15 @@ pub enum TracingPropertiesError {
     InvalidTimestamp(#[from] time::error::ComponentRange),
 }
 
+// Вспомогательная функция: конвертирует строковый ключ заголовка в ShortStr.
+// Паника невозможна: все имена полей определены как константы длиной < 255 байт.
 fn field_short_str(field: &str) -> ShortStr {
     field.try_into().expect("Длина хедера всегда меньше 255")
 }
 
 impl Default for AsezRabbitProperties {
+    // Сообщения по умолчанию -- персистентные JSON.
+    // `with_persistence(true)` означает delivery_mode = 2: сообщение выживет при рестарте брокера.
     fn default() -> Self {
         Self {
             basic_props: BasicProperties::default()
@@ -170,6 +203,8 @@ impl Default for AsezRabbitProperties {
 }
 
 impl From<BasicProperties> for AsezRabbitProperties {
+    // Используется при получении входящего сообщения: переносим уже существующие
+    // заголовки в отдельную таблицу, чтобы можно было читать и дописывать их.
     fn from(basic_props: BasicProperties) -> Self {
         let headers = basic_props.headers().cloned().unwrap_or_default();
         Self {
@@ -179,8 +214,10 @@ impl From<BasicProperties> for AsezRabbitProperties {
     }
 }
 
-/// Creates a tracing span with ASEZ common fields filled
-/// basing on the provided Rabbit field table.
+/// Создаёт span трассировки и заполняет его полями из AMQP-заголовков входящего сообщения.
+///
+/// Если заголовки отсутствуют, поля span остаются пустыми -- трейс не разрывается,
+/// но корреляция с вышестоящим запросом теряется.
 pub fn get_rabbit_span(properties: &BasicProperties) -> Span {
     use igg_tracing::tracing_fields::*;
     use tracing::info_span;
@@ -221,7 +258,11 @@ pub fn get_rabbit_span(properties: &BasicProperties) -> Span {
     }
 }
 
-/// По свойствам сообщения строит набор полей для трассировки.
+/// По AMQP-свойствам входящего сообщения восстанавливает полный набор полей трассировки.
+///
+/// Возвращает `None`, если заголовки трассировки отсутствуют (сообщение пришло не через HTTP).
+/// Возвращает `Err`, если заголовки есть, но не читаются (битые данные или неверный формат).
+/// При успехе результат можно передать в `tracing::Span` через `add_tracing_fields`.
 pub fn basic_properties_to_tracing_fields(
     properties: &BasicProperties,
 ) -> Result<Option<AsezTracingFieldsCollection>, TracingPropertiesError> {
@@ -287,7 +328,15 @@ pub fn basic_properties_to_tracing_fields(
             .get(&field_short_str(TIMESTAMP))
             .map(|x| {
                 if let FieldValue::T(v) = x {
-                    Ok(OffsetDateTime::from_unix_timestamp(*v as i64)?)
+                    // Чужой клиент может прислать u64 близкий к MAX — без проверки
+                    // `as i64` молча даст отрицательное значение и поломает round-trip.
+                    let secs = i64::try_from(*v).map_err(|_| {
+                        TracingPropertiesError::InvaldFieldValueType(
+                            TIMESTAMP,
+                            format!("timestamp вне диапазона i64: {v}"),
+                        )
+                    })?;
+                    Ok(OffsetDateTime::from_unix_timestamp(secs)?)
                 } else {
                     Err(TracingPropertiesError::InvaldFieldValueType(
                         TIMESTAMP,

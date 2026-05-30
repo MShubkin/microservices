@@ -6,6 +6,9 @@ use quote::quote;
 use syn::*;
 use syn::{parse_macro_input, DeriveInput};
 
+// Строковые константы атрибутов — используются и в `has_attr`, и в
+// `find_name_value_attr`, поэтому выносим сюда, чтобы опечатка не
+// привела к тихому молчанию макроса.
 const ADAPTOR_RENAME: &str = "adaptor_rename";
 const ADAPTOR_TYPE: &str = "adaptor_type";
 const ADAPTOR_FROM: &str = "adaptor_from";
@@ -18,43 +21,71 @@ pub(crate) const ADAPTOR_ATTRIBUTE_FOR_ALL: &str = "adaptor_attribute_for_all";
 const ADAPTOR_FIELD_DUPLICATE: &str = "adaptor_field_duplicate";
 const ADAPTOR_FIELDS_WITH_VALUES: &str = "adaptor_fields_with_values";
 
+/// Направление конвертации для [`make_conversion`].
+///
+/// `F` (forwards) — из адаптора в DbItem (`into_item`).
+/// `R` (reverse) — из DbItem в адаптор (`from_item_masked`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ConversionKind {
     F,
     R,
 }
 
-/// This function derives adaptor in its totality.
+/// Точка входа `#[derive(DbAdaptor)]`.
+///
+/// Генерирует теневую структуру-адаптор `{Name}Rep` (или с именем из
+/// `adaptor_rename`) и реализует для неё трейт `DbAdaptor`.
+///
+/// Ключевые шаги:
+/// 1. Переименовываем структуру (`adaptor_rename`) и обрабатываем поля
+///    (`process_fields`): каждое поле превращается в `Option<T>`.
+/// 2. Собираем поля-дубликаты (`adaptor_field_duplicate`) — это поля,
+///    которые присутствуют в адапторе под двумя именами сразу, но в
+///    DbItem хранятся один раз. Нужно для того, чтобы фронтенд мог
+///    читать одно и то же значение через разные ключи (например,
+///    `id` и `item_id` одновременно).
+/// 3. Генерируем прямые (`F`) и обратные (`R`) конвертации — они
+///    учитывают `adaptor_from`, `adaptor_try_from`, `adaptor_into`.
+/// 4. Опционально генерируем `DbAdaptorFieldsWithValues` для экспорта
+///    всех полей в виде `Vec<Field>` (нужно для Excel/CSV).
 pub(crate) fn adaptor_inner(inp: TokenStream) -> TokenStream {
     let inp = parse_macro_input!(inp as DeriveInput);
     let vis = &inp.vis;
 
-    // Get a new name for our structure.
+    // Имя адаптора: по умолчанию `{OldName}Rep`, переопределяется через
+    // `#[adaptor_rename = "CustomName"]` на структуре.
     let old_name = &inp.ident;
     let default_name = Ident::new(&format!("{}Rep", old_name), Span::call_site());
     let new_name = rename(&inp.attrs, "adaptor_rename", &default_name);
 
-    // Panic quickly if we are not dealing with a structure.
-    // (For `sqlx` DB items enums are of dubious utility).
+    // Ранняя проверка — `DbAdaptor` применим только к структурам,
+    // для enum он бессмысленен (нет именованных полей для частичного обновления).
     let input_struct = get_struct(&inp, "DbAdaptor", old_name);
     let fields = get_named_fields(input_struct, "DbAdaptor");
 
-    // This is the big panic that stops us before we go too far.
     if fields.is_empty() {
         panic!("`DbItem` does not deal with empty structures.");
     }
+    // Индексы полей нужны для генерации `mask[#field_counts]` в методах
+    // `bind_mask`, `zero_fields`, `unset_fields`, `from_item_masked`.
     let field_counts = (0..fields.len()).collect::<Vec<usize>>();
 
+    // Оригинальные имена полей DbItem используются в `into_item` и
+    // `into_item_merged` для присваивания `Self::DbItem { field: ... }`.
     let old_field_names =
         fields.iter().map(|x| x.ident.as_ref().unwrap()).collect::<Vec<_>>();
 
+    // Преобразуем поля: переименовываем и оборачиваем в `Option<T>`.
     let adaptor_fields = process_fields(&fields);
-    // Some fields are duplicated.
+    // Дублирующие поля — отдельный список, потому что они не входят в
+    // `DbItem::FIELDS` и не учитываются в `bind_mask`/`field_counts`.
     let (duplicate, dup_field_indices) = duplicate_fields(&fields);
 
     let new_field_names = get_ident(&adaptor_fields);
     let new_duplicate_fname = get_ident(&duplicate);
 
+    // Объединённый список всех полей адаптора (основные + дубликаты)
+    // нужен для `DbAdaptorFieldsWithValues::FIELDS`.
     let combined_field_names: Vec<_> = new_field_names
         .iter()
         .chain(new_duplicate_fname.iter())
@@ -63,7 +94,10 @@ pub(crate) fn adaptor_inner(inp: TokenStream) -> TokenStream {
 
     let dup_field_counter = 0..new_duplicate_fname.len();
 
-    // Here we create the forwards and backwards conversions for the fields.
+    // `forwards` — выражения для `into_item`: Adaptor.field → DbItem.field.
+    // `backwards` — выражения для `from_item_masked`: DbItem.field → Adaptor.field.
+    // `backwards_dup` — то же, но для дублирующих полей (с `.clone()` чтобы
+    // не потреблять значение раньше времени).
     let (forwards, _) =
         field_conversion(&fields, &adaptor_fields, &[], ConversionKind::F);
     let (backwards, backwards_dup) = field_conversion(
@@ -73,19 +107,19 @@ pub(crate) fn adaptor_inner(inp: TokenStream) -> TokenStream {
         ConversionKind::R,
     );
 
-    // This refers to the #[derive(X, Y, Z)]
+    // Атрибуты-наследники: derive-трейты, внешние атрибуты структуры и
+    // атрибуты, применяемые ко всем полям.
     let derives = retain_attributes(&inp.attrs, ADAPTOR_DERIVE);
-    // This refers to eg #[serde(X, Y, Z)]
     let outer_attributes = adaptor_attributes(&inp.attrs, ADAPTOR_ATTRIBUTES);
-    // This refers to eg #[serde(X, Y, Z)], and applies to all fields.
     let extra_inherits = adaptor_attributes(&inp.attrs, ADAPTOR_ATTRIBUTE_FOR_ALL);
 
-    // This refers to eg #[serde(X, Y, Z)] of individual fields.
+    // Атрибуты конкретных полей (например, `#[serde(rename = "...")]`).
     let inherited_field_attrs =
         fields.iter().map(|x| inherit_attributes(x, &extra_inherits));
     let inherited_duplicate_attrs =
         duplicate.iter().map(|x| inherit_attributes(x, &extra_inherits));
 
+    // Объединённый список полей для `DbAdaptorFieldsWithValues`.
     let combined_field: Vec<_> =
         adaptor_fields.iter().chain(duplicate.iter()).cloned().collect();
     let combined_field_counts = (0..combined_field.len()).collect::<Vec<usize>>();
@@ -96,6 +130,9 @@ pub(crate) fn adaptor_inner(inp: TokenStream) -> TokenStream {
     let mut stream = quote! {
         # (#derives)*
         # (#outer_attributes)*
+        // `#[serde(default)]` на структуре — отсутствующее поле в JSON становится
+        // `None` (Default для Option), а не ошибкой десериализации. Именно это
+        // обеспечивает семантику "поле не передано = не трогать".
         #[serde(default)]
         #vis struct #new_name {
             #(
@@ -111,9 +148,14 @@ pub(crate) fn adaptor_inner(inp: TokenStream) -> TokenStream {
         impl asez2_shared_db::db_item::DbAdaptor for #new_name {
             type DbItem = #old_name;
 
+            // DUP_FIELDS содержит только имена дублирующих полей — тех,
+            // которых нет в DbItem::FIELDS. Разделение нужно чтобы
+            // DbAdaptorFieldMask мог обрабатывать оба набора независимо.
             const DUP_FIELDS: &'static [&'static str] = &[#(stringify!(#new_duplicate_fname),)*];
 
             fn into_item(self) -> asez2_shared_db::result::Result<Self::DbItem> {
+                // `a` — соглашение: все сгенерированные выражения конвертации
+                // обращаются к `a.field_name`, поэтому переименовываем `self`.
                 let a = self;
                 Ok(Self::DbItem {
                     #(
@@ -122,9 +164,14 @@ pub(crate) fn adaptor_inner(inp: TokenStream) -> TokenStream {
                 })
             }
 
-            /// An optional list of fields to send is supplied. This allows us to deactivate
-            /// certain fields before conversion and send only the remaining fields.
-            /// NB: We do not apply tolerance internally here.
+            /// Конвертирует DbItem в адаптор с учётом маски полей.
+            ///
+            /// Поля вне маски устанавливаются в `None` — это значит "не передавать
+            /// фронтенду". Используется при ответе сервера: если клиент запросил
+            /// только часть полей, остальные должны быть опущены в JSON.
+            ///
+            /// NB: tolerance (псевдонимы полей) здесь не применяется — маска
+            /// уже построена по каноническим именам.
             fn from_item_masked(
                 item: Self::DbItem,
                 mask: &asez2_shared_db::db_item::DbAdaptorFieldMask<Self>,
@@ -136,6 +183,8 @@ pub(crate) fn adaptor_inner(inp: TokenStream) -> TokenStream {
 
                 let a = item;
                 let output = #new_name {
+                    // Дублирующие поля идут первыми — они читают `a.field.clone()`,
+                    // поэтому важно, что они не потребляют значение до основного поля.
                     #(
                         #new_duplicate_fname: match dup_mask[#dup_field_counter] {
                             true => #backwards_dup,
@@ -152,24 +201,30 @@ pub(crate) fn adaptor_inner(inp: TokenStream) -> TokenStream {
                 output
             }
 
+            /// Строит маску по тому, какие поля адаптора не `None`.
+            ///
+            /// Используется при частичном UPDATE: только поля с `Some(v)` попадают
+            /// в SET-часть запроса. Дублирующие поля не участвуют — они не
+            /// соответствуют колонкам в таблице.
             fn bind_mask(&self) -> asez2_shared_db::db_item::DbFieldMask<Self::DbItem>
             {
                 let mut mask = asez2_shared_db::db_item::DbFieldMask::<Self::DbItem>::none();
-                // If the value is not the default value, we can update it.
-                // With the current implementation, default means we got a None
-                // from the Json deserialization.
                 #(
                     mask[#field_counts] = self.#new_field_names.is_some();
                 )*
                 mask
             }
 
+            /// Строгий вариант `bind_mask` для массового UPDATE: требует, чтобы
+            /// одно и то же множество полей было `Some` во всех элементах среза.
+            ///
+            /// Это нужно для UNNEST-запроса: все строки должны обновлять одинаковый
+            /// набор колонок, иначе запрос нельзя построить в виде одного UPDATE.
             fn create_strict_bind_mask(items: &[Self]) -> asez2_shared_db::result::Result<asez2_shared_db::db_item::DbFieldMask<Self::DbItem>> {
                 let mut mask = asez2_shared_db::db_item::DbFieldMask::<Self::DbItem>::none();
-                // If the value is not the default value, we can update it.
-                // With the current implementation, default means we got a None
-                // from the Json deserialization.
                 #(
+                    // Свёртка: если хотя бы один элемент имеет поле Some, а другой None
+                    // — это ошибка несогласованности батча.
                     let mask_val = items.iter().fold(Ok(false), |acc, x| {
                         match (acc, x.#new_field_names.is_some()) {
                             (Ok(true), false) => Err(asez2_shared_db::result::SharedDbError::Other(
@@ -184,6 +239,9 @@ pub(crate) fn adaptor_inner(inp: TokenStream) -> TokenStream {
                 Ok(mask)
             }
 
+            /// Применяет адаптор к существующему DbItem: перезаписывает только те поля,
+            /// где значение `Some`. Используется для PATCH-семантики: берём текущую
+            /// запись из БД и накладываем поверх неё изменения от фронтенда.
             fn into_item_merged(self, mut item: Self::DbItem) -> asez2_shared_db::result::Result<Self::DbItem> {
                 let a = self;
                 #(
@@ -194,6 +252,10 @@ pub(crate) fn adaptor_inner(inp: TokenStream) -> TokenStream {
                 Ok(item)
             }
 
+            /// Переводит поля из маски в `Some(Default::default())`.
+            ///
+            /// Используется когда нужно явно "обнулить" значения в адапторе:
+            /// поле становится `Some(default)`, то есть UPDATE напишет дефолт в БД.
             fn zero_fields(mut self, fields: &asez2_shared_db::db_item::DbFieldMask<Self::DbItem>) -> Self {
                 #(
                     if fields[#field_counts] {
@@ -201,9 +263,12 @@ pub(crate) fn adaptor_inner(inp: TokenStream) -> TokenStream {
                     }
                 )*
                 self
-
             }
 
+            /// Переводит поля из маски в `None`.
+            ///
+            /// Используется чтобы исключить поля из UPDATE: поле становится `None`,
+            /// и `bind_mask` его проигнорирует.
             fn unset_fields(mut self, fields: &asez2_shared_db::db_item::DbFieldMask<Self::DbItem>) -> Self {
                 #(
                     if fields[#field_counts] {
@@ -211,10 +276,12 @@ pub(crate) fn adaptor_inner(inp: TokenStream) -> TokenStream {
                     }
                 )*
                 self
-
             }
         }
     };
+    // `adaptor_fields_with_values` генерируется только по явному запросу,
+    // потому что реализация требует `Value::from` для каждого типа поля,
+    // что не всегда выполнимо (например, для вложенных структур без `Into<Value>`).
     if has_attr(&inp.attrs, ADAPTOR_FIELDS_WITH_VALUES) {
         stream.extend(quote! {
             impl asez2_shared_db::db_item::DbAdaptorFieldsWithValues for #new_name {
@@ -233,9 +300,14 @@ pub(crate) fn adaptor_inner(inp: TokenStream) -> TokenStream {
     stream.into()
 }
 
-/// This function creates a list of function calls `function(variable)` which then
-/// become part of a conversion for a field, ie `field_name: function(variable),`
-/// where the `variable` is usually the same field of the original structure.
+/// Строит вектор выражений конвертации поля для всего списка полей.
+///
+/// Возвращает два вектора:
+/// - основные конвертации (один к одному с `input_fields`)
+/// - конвертации для дублирующих полей по `duplicate_indices`
+///
+/// Дублирующие поля читают то же поле `a.X`, но с `.clone()` — иначе
+/// значение будет потреблено при первом использовании.
 pub(super) fn field_conversion(
     input_fields: &[Field],
     adaptor_fields: &[Field],
@@ -260,8 +332,21 @@ pub(super) fn field_conversion(
     (convert, convert_duplicate)
 }
 
-// This does not recursively convert fields. Thus all fields must be internally convertible, else the
-// conversion must be handled specifically by the stated function.
+/// Строит одно выражение конвертации для пары полей `(field_a, field_b)`.
+///
+/// Для направления `F` (Adaptor → DbItem):
+/// - `adaptor_from = "fn"` → `a.field.map(|x| fn(x)).unwrap_or_default()`
+/// - `adaptor_try_from = "fn"` → то же, но с `?` (fallible)
+/// - по умолчанию → `a.field.map(|x| Into::into(x)).unwrap_or_default()`
+///
+/// Для направления `R` (DbItem → Adaptor):
+/// - `adaptor_into = "fn"` → `Some(fn(a.field))`
+/// - по умолчанию → `Some(Into::into(a.field))`
+///
+/// `clone = true` используется для дублирующих полей, чтобы не потребить
+/// значение при первом обращении.
+// Конвертация не рекурсивная: если тип требует сложного преобразования,
+// его нужно задать через `adaptor_from`/`adaptor_into` явно.
 pub(super) fn make_conversion(
     field_a: &Field,
     field_b: &Field,
@@ -318,15 +403,16 @@ pub(super) fn make_conversion(
         }
     };
     let fname = &f.ident;
-    // We must clone duplicated fields since otherwise some of them, eg string fields
-    // will be consumed during the first conversion.
+    // Дублирующие поля клонируются, чтобы не потребить `a.field`
+    // до того, как основное поле выполнит свою конвертацию.
     let field = match clone {
         false => quote! { a.#fname },
         true => quote! { a.#fname.clone() },
     };
 
     match kind {
-        // NB: We use "a" as the variable name.
+        // `a` — соглашение: везде в сгенерированном коде входная структура
+        // переименована в `a` (через `let a = self` или `let a = item`).
         ADAPTOR_FROM => parse_quote!{ #field.map(|x| #convertor(x)).unwrap_or_default() },
         ADAPTOR_INTO => parse_quote!{ Some(#convertor(#field)) },
         ADAPTOR_TRY_FROM => parse_quote!{ #field.map(|x| #convertor(x)).transpose()?.unwrap_or_default() },
@@ -337,15 +423,21 @@ pub(super) fn make_conversion(
     }
 }
 
+/// Применяет `process_field` ко всем полям структуры.
 pub(super) fn process_fields(input_fields: &[Field]) -> Vec<Field> {
     input_fields
         .iter()
         .cloned()
-        // Here the field is renamed and
         .map(|x| process_field(x, ADAPTOR_RENAME))
         .collect::<Vec<_>>()
 }
 
+/// Выделяет дублирующие поля из списка полей.
+///
+/// Возвращает пару `(поля, индексы)`:
+/// - поля — обработанные Field с именем из `adaptor_field_duplicate`
+/// - индексы — позиции в исходном массиве, нужны для выбора правильного
+///   выражения конвертации в `field_conversion`
 fn duplicate_fields(input_fields: &[Field]) -> (Vec<Field>, Vec<usize>) {
     let pre_fields = input_fields
         .iter()
@@ -361,25 +453,27 @@ fn duplicate_fields(input_fields: &[Field]) -> (Vec<Field>, Vec<usize>) {
     (new, indices)
 }
 
-/// This function exists to process fields. It does so in several stages.
+/// Обрабатывает одно поле для включения в адаптор:
 ///
-/// 1. Rename the field.
-/// 2. Retype the field.
-/// 3. Strip all attributes but `adaptor_derive` attributes.
+/// 1. Переименовывает: `adaptor_rename` или `adaptor_field_duplicate` → новый ident.
+/// 2. Оборачивает тип в `Option<T>` или `Option<NewType>` (если задан `adaptor_type`).
+/// 3. Стирает атрибуты proc-macro — в итоговом коде они не нужны,
+///    остаются только derive-трейты для полей через `adaptor_derive`.
 fn process_field(mut x: Field, rename_kind: &str) -> Field {
     let old_ident = x.ident.expect("Adaptor is only derived for named fields.");
     x.ident = Some(rename(&x.attrs, rename_kind, &old_ident));
     x.ty = retype(&x.attrs, ADAPTOR_TYPE, x.ty.clone());
-    // Stripping attributes is done last.
+    // Стираем атрибуты в последнюю очередь: retype и rename читают их выше.
     x.attrs = retain_attributes(&x.attrs, ADAPTOR_DERIVE);
     x
 }
 
-/// This function takes an attribute wrapped in:
-/// `#[adaptor_attribute(my_attr(..))]`
-/// and unwraps it into:
-/// `kind` should be "adaptor_attributes" or "adaptor_attribute_for_all"
-/// `#[my_attr(..)]`
+/// Разворачивает атрибуты вида `#[adaptor_attributes(#[serde(rename_all = "camelCase")])]`
+/// в плоский список `[#[serde(rename_all = "camelCase")]]`.
+///
+/// `kind` определяет имя оборачивающего атрибута:
+/// - `adaptor_attributes` — атрибуты только для структуры адаптора
+/// - `adaptor_attribute_for_all` — атрибуты для всех полей адаптора
 pub(super) fn adaptor_attributes(
     inp_attrs: &[Attribute],
     kind: &str,
@@ -396,11 +490,21 @@ pub(super) fn adaptor_attributes(
         .collect::<Vec<_>>()
 }
 
+/// Собирает финальный список атрибутов для поля адаптора.
+///
+/// Порядок приоритетов: атрибуты самого поля (`adaptor_attributes` на поле)
+/// имеют приоритет над атрибутами структуры (`adaptor_attribute_for_all`).
+/// Это нужно чтобы поле могло переопределить, например, `#[serde(skip)]`
+/// даже если на структуре стоит `#[serde(rename_all = "camelCase")]`.
+///
+/// После этого добавляются два обязательных serde-атрибута для Option-полей:
+/// - `#[serde(with = "DbAdaptorOption")]` — кастомный (де)сериализатор,
+///   который правильно обрабатывает вложенный `Option` (null vs. отсутствие).
+/// - `#[serde(skip_serializing_if = "Option::is_none")]` — поле не сериализуется,
+///   если оно `None`, то есть не передаётся в JSON-ответе вообще.
 fn inherit_attributes(f: &Field, extra_inherits: &[Attribute]) -> Vec<Attribute> {
     let mut attrs = adaptor_attributes(&f.attrs, ADAPTOR_ATTRIBUTES);
-    // This prevents appending attributes with the same path to a field
-    // (which would cause an error).
-    // It also ensures precedence of field attributes over struct attributes.
+    // Атрибуты с тем же путём не дублируем: поле имеет приоритет.
     for x in extra_inherits.iter() {
         if !attrs.iter().any(|own_attr| own_attr.path() == x.path()) {
             attrs.push(x.to_owned());

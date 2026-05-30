@@ -1,12 +1,12 @@
-//! This submodule describes a select clause builder.
+//! Построитель SELECT-запросов.
 //!
-//! The reason that this is placed inside the `db_item` module is because it is linked
-//! to the `DbItem` that it is getting.
+//! Модуль намеренно живёт внутри `db_item`, потому что тесно связан с [`DbItem`]:
+//! при сборке запроса проверяет, что все запрошенные поля реально существуют
+//! в таблице (по константе `T::FIELDS`).
 //!
-//! Currently the module assumes that the selection instructions are the same for all crates
-//! that depend on `asez2_db_shared`. However, it is always possible to make an adapter
-//! structure on the side of the crate using `asez2_db_shared` for incoming requests that use
-//! a format that is not compatible with this `Select` as all of its fields are public.
+//! Предполагается, что структура [`Select`] одинакова для всех крейтов, которые
+//! зависят от `asez2_db_shared`. Если формат запросов фронтенда отличается,
+//! его адаптируют до [`Select`] снаружи -- все поля структуры публичны.
 use super::{BindQuery, DbItem};
 use crate::result::Result;
 use crate::value::Value;
@@ -25,24 +25,29 @@ pub mod filters;
 mod tests;
 pub use filters::{Filter, FilterTree, SelectionKind};
 
-/// This is designed as a more or less safe interface for creating get queries.
+/// Внутренний строитель SQL-строки запроса.
+///
+/// Не создаётся напрямую -- используется через `DbItem::select` и
+/// `DbItem::select_paginated`. Хранит текущую строку запроса и счётчик
+/// привязок, чтобы корректно нумеровать placeholder'ы `$N` при соединении
+/// нескольких selects в один запрос (joined queries).
 pub struct SelectMaker<T> {
     query_defn: Select,
     query_string: String,
-    // The number of bound variables. Mostly for filter values.
+    /// Текущий счётчик привязанных переменных. Начинается с 1 для одиночных,
+    /// или с N+1 при вложении в составной запрос.
     binds: usize,
     phantom_data: PhantomData<T>,
 }
 
-// NB: Almost everything is async because some operations might start longer than 10us, which
+// NB: Почти всё async, потому что некоторые операции могут занимать >10 мкс.
 impl<T: DbItem + Unpin> SelectMaker<T> {
-    /// Start the query by checking that the fields are correct and
-    /// then making a simple query of `SELECT columns FROM table`.
-    /// This can then be used or expanded with sort/filter clauses.
+    /// Инициализирует построитель из заданной таблицы `table` с начальным
+    /// смещением счётчика `start_bind`.
     ///
-    /// The `start_bind` should be 1 for a new/single select. However can be should
-    /// be set to N+1 where N is the current number of binds in a query, if the select
-    /// is part of a multiselect query, eg:
+    /// Применяется при вложенных запросах (joined queries), где нумерация
+    /// `$N` должна продолжаться после предыдущего select'а.
+    /// Пример вложенного запроса:
     /// ```sql
     /// SELECT (name, age)
     /// FROM (select (id, name) from names where origin IN($1,$2)) as n
@@ -57,18 +62,17 @@ impl<T: DbItem + Unpin> SelectMaker<T> {
         with_count: bool,
     ) -> Result<SelectMaker<T>> {
         let mut q = q.clone();
-        // This step renames frontend fields to backend fields.
+        // Переименовываем поля фронтенда в реальные имена колонок.
         T::apply_tolerance_to_select(&mut q);
-        // Check must take place after substitution of fields.
+        // Проверка допустимости полей должна идти ПОСЛЕ подстановки.
         Self::check_select(&q)?;
 
         let selection = {
             let mut field_list = String::new();
-            // Check that fields are ok.
             for rec_field in q.field_list.iter() {
                 field_list.extend(format!("{},", rec_field).chars());
             }
-            // If field list is empty we retrieve all fields.
+            // Пустой список полей означает SELECT *.
             if field_list.is_empty() {
                 field_list.push('*');
             } else {
@@ -76,6 +80,8 @@ impl<T: DbItem + Unpin> SelectMaker<T> {
             }
 
             if with_count {
+                // Добавляем оконную функцию для подсчёта полного числа строк
+                // без второго запроса к БД.
                 field_list
                     .push_str(&format!(", COUNT(*) OVER() AS {}", TOTAL_COUNT));
             }
@@ -93,33 +99,32 @@ impl<T: DbItem + Unpin> SelectMaker<T> {
         Ok(Self {
             query_defn: q,
             query_string,
-            binds: start_bind, // NB: Index starts at 1 in SQL.
+            binds: start_bind, // NB: нумерация SQL начинается с 1.
             phantom_data: PhantomData,
         })
     }
 
-    /// Start the query by checking that the fields are correct and
-    /// then making a simple query of `SELECT columns FROM table`.
-    /// This can then be used or expanded with sort/filter clauses.
+    /// Инициализирует построитель для таблицы `T::TABLE` с нумерацией с 1.
     pub(super) async fn start(q: &Select) -> Result<SelectMaker<T>> {
         Self::start_from(q, 1, T::TABLE, false).await
     }
 
-    /// Start the counting query by checking that the fields are correct and
-    /// then making a simple query of `SELECT columns FROM table`.
-    /// This can then be used or expanded with sort/filter clauses.
+    /// Инициализирует построитель с добавлением `COUNT(*) OVER()` для пагинации.
     pub(super) async fn start_with_count(q: &Select) -> Result<SelectMaker<T>> {
         Self::start_from(q, 1, T::TABLE, true).await
     }
 
-    /// Достаёт строку с порядком, но не добавляет её к query.
-    /// Полезен для aggregate join.
-    /// НБ: Порядок этих функций меняет строку, всегда вызывайте add_order после add_filters
+    /// Возвращает ORDER BY-строку без добавления её к запросу.
+    ///
+    /// Нужен для агрегированных JOIN'ов, где порядок сортировки передаётся
+    /// снаружи, а не встраивается в подзапрос.
+    /// НБ: порядок вызовов важен -- `add_order` всегда после `add_filters`.
     pub(super) fn get_order(&self) -> String {
         FieldSortOrder::as_order_by(&self.query_defn.order_list).unwrap_or_default()
     }
 
-    /// НБ: Порядок этих функций меняет строку, всегда вызывайте add_order после add_filters
+    /// Дописывает ORDER BY к строке запроса.
+    /// НБ: порядок вызовов важен -- `add_order` всегда после `add_filters`.
     async fn add_order(mut self) -> SelectMaker<T> {
         let sort_order = self.get_order();
         self.query_string.push_str(&sort_order);
@@ -128,8 +133,7 @@ impl<T: DbItem + Unpin> SelectMaker<T> {
 
     async fn add_filters(mut self) -> Result<SelectMaker<T>> {
         let mut bounds = self.binds;
-        // NB: We skip empty values to avoid situations like `WHERE column_a;`
-        // This is not a hard error because requests often contain this kind of empty filter_list.
+        // Пустой filter_list -- не ошибка, просто запрос без WHERE.
         if self.query_defn.filter_list.is_empty() {
             return Ok(self);
         }
@@ -143,7 +147,8 @@ impl<T: DbItem + Unpin> SelectMaker<T> {
         Ok(self)
     }
 
-    /// TODO: Change this to chunk...
+    /// Добавляет OFFSET и FETCH NEXT к строке запроса.
+    /// TODO: Заменить на chunk-based подход.
     fn add_limits(mut self) -> SelectMaker<T> {
         if let Some(n) = self.query_defn.offset {
             self.query_string.push_str(&format!(" OFFSET {n}"));
@@ -156,20 +161,23 @@ impl<T: DbItem + Unpin> SelectMaker<T> {
         self
     }
 
-    /// ALWAYS call `stack` after start/start_from as it guarantees the correct order of addition.
+    /// Финализирует построитель, добавляя фильтры, сортировку и лимиты.
+    ///
+    /// Всегда вызывать после `start`/`start_from`. Метод гарантирует правильный
+    /// порядок добавления частей запроса: WHERE -> ORDER BY -> OFFSET/FETCH.
     pub(super) async fn stack(self) -> Result<SelectMaker<T>> {
         let r = self.add_filters().await?.add_order().await.add_limits();
         Ok(r)
     }
 
-    /// Finalises the query string by pushing a `;` and then returns it into the wild.
+    /// Добавляет `;` и возвращает готовый запрос с привязанными переменными.
     pub(super) fn bind(&mut self) -> BindQuery<'_> {
         self.query_string.push(';');
         let query = sqlx::query(&self.query_string);
         self.query_defn.bind_vars_to_query(query)
     }
 
-    /// Finalises the query string by pushing a `;` and then returns it into the wild.
+    /// Добавляет `;`, привязывает переменные и выполняет запрос.
     pub(super) async fn bind_and_execute<'b, Ex>(
         mut self,
         pool: Ex,
@@ -187,9 +195,10 @@ impl<T: DbItem + Unpin> SelectMaker<T> {
             .map_err(Into::into)
     }
 
-    /// Binds this select variables to the specified query.
+    /// Привязывает переменные этого select'а к внешнему запросу.
     ///
-    /// Used to combine several selects in a single query.
+    /// Нужно для объединения нескольких select'ов в один запрос --
+    /// каждый вносит свои переменные в общий `BindQuery`.
     pub(super) fn bind_to_query<'b>(
         &'b self,
         query: BindQuery<'b>,
@@ -197,17 +206,21 @@ impl<T: DbItem + Unpin> SelectMaker<T> {
         self.query_defn.bind_vars_to_query(query)
     }
 
-    /// Checks the Select for safety (injections, incompatible tables, etc).
+    /// Проверяет корректность [`Select`] для данной таблицы.
+    ///
+    /// Убеждается, что все поля из `field_list`, `order_list`, `filter_list`
+    /// и `distinct_on` реально существуют в `T::FIELDS`. Это защита от
+    /// SQL-инъекций через имена полей и от опечаток.
+    ///
+    /// Пропускает проверку если `skip_main_check == true` (для производных
+    /// selects, где поля уже проверены ранее).
     pub(super) fn check_select(q: &Select) -> Result<()> {
-        // If the select is prefiltered, we skip the other checks.
         if q.skip_main_check {
             return Ok(());
         }
 
         let fields = T::FIELDS.iter().copied().collect::<AHashSet<&str>>();
         let filter_slice = q.filter_list.slice();
-        // Check that fields are ok. (NB: We do not need any complex checks here
-        // since the fields are predefined by the table.
         let s_fields = q.field_list.iter().map(|x| ("Field", x));
         let d_fields = q.distinct_on.iter().map(|x| ("Distinct field", x));
         let s_orders = q.order_list.iter().map(|o| ("Order key", &o.field));
@@ -241,8 +254,11 @@ impl<T: DbItem + Unpin> SelectMaker<T> {
     }
 }
 
+/// Описание одного SELECT-запроса к таблице.
+///
+/// Сериализуется/десериализуется для передачи с фронтенда. Поля публичны,
+/// чтобы снаружи можно было собрать адаптер если формат API отличается.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
-/// Defines a complete select from a single table.
 pub struct Select {
     #[serde(rename = "column_list")]
     pub field_list: Vec<String>,
@@ -255,16 +271,17 @@ pub struct Select {
     pub take_n: Option<usize>,
     #[serde(default)]
     pub count_total: Option<bool>,
-    /// distinct on clause. Gives a list of fields to be distinct on.
+    /// Поля для DISTINCT ON. Если используется с ORDER BY, эти поля обязаны
+    /// присутствовать в ORDER BY первыми.
     #[serde(default)]
     pub distinct_on: Vec<String>,
-    /// Indicates that the select is already filtered and does not need
-    /// an extra check.
+    /// Пропустить проверку полей в `SelectMaker::check_select`.
+    /// Выставляется у производных select'ов, где поля уже проверены.
     #[serde(skip)]
     pub skip_main_check: bool,
 }
 
-/// Позиция NULL значений при сортировке
+/// Позиция NULL значений при сортировке.
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
 pub enum NullPosition {
     /// NULLS FIRST
@@ -273,8 +290,8 @@ pub enum NullPosition {
     Last,
 }
 
+/// Порядок сортировки по одному полю.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-/// NB: Serde is derived to map using `impl_serde_map` macro.
 pub struct FieldSortOrder {
     #[serde(rename = "column_id")]
     pub field: String,
@@ -290,8 +307,8 @@ pub struct FieldSortOrder {
     pub null_position: Option<NullPosition>,
 }
 
+/// Направление сортировки: возрастающее или убывающее.
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
-/// NB: Serde is derived to map using `impl_serde_map` macro.
 pub enum FieldSortKind {
     #[serde(rename = "a")]
     Asc,
@@ -315,7 +332,8 @@ impl Display for FieldSortOrder {
 }
 
 impl FieldSortOrder {
-    /// This creates the ORDER BY clause.
+    /// Строит строку вида `ORDER BY field1 ASC, field2 DESC`.
+    /// Возвращает `None` для пустого списка.
     fn as_order_by(v: &[Self]) -> Option<String> {
         let mut iter = v.iter();
 
@@ -343,7 +361,7 @@ impl NullPosition {
 }
 
 impl Select {
-    // Bind internal variables onto a query
+    // Привязывает переменные фильтров к запросу.
     pub(super) fn bind_vars_to_query<'a>(
         &'a self,
         query: BindQuery<'a>,
@@ -351,7 +369,11 @@ impl Select {
         self.filter_list.bind_vars_to_query(query)
     }
 
-    /// A convenience function for making a select with fields.
+    /// Создаёт Select с заданным списком полей.
+    ///
+    /// Поля обычно передаются как константы, сгенерированные `#[derive(DbItem)]`:
+    /// `Select::with_fields([MyEntity::name, MyEntity::created_at])`.
+    /// Это даёт проверку имён на этапе компиляции.
     pub fn with_fields<F, I>(fields: I) -> Self
     where
         F: Display,
@@ -366,25 +388,26 @@ impl Select {
         }
     }
 
-    /// This is a convenience function for when you want to select all fields.
+    /// Создаёт Select, включающий все поля таблицы `T`.
     pub fn full<T: DbItem>() -> Self {
         Self::with_fields(T::FIELDS)
     }
 
-    /// Adds the field with specified name to the list of selected fields.
+    /// Добавляет ещё одно поле к списку выборки.
     pub fn and_field<I: Display>(mut self, field: I) -> Self {
         self.field_list.push(field.to_string());
         self
     }
 
-    /// Add filter to a select. The behaviour is as follows:
-    /// 1. If the filter already exists it is expanded. Otherwise a fully new filter
-    ///    if added.
-    /// 2. If a given `selection_kind` value exists for a filter, the value list
-    ///    is expanded, but only with values not already in it. Otherwise the
-    ///    `selection_kind` is added with all values.
+    /// Добавляет или расширяет фильтр для поля.
     ///
-    /// This also forms the core of the filter injection mechanism.
+    /// Логика:
+    /// 1. Если фильтр по этому полю уже есть и тип совпадает -- добавляем значения.
+    /// 2. Если тип не совпадает -- добавляем новый фильтр через AND.
+    /// 3. Если фильтра ещё нет -- добавляем новый.
+    ///
+    /// Это основа механизма инъекции фильтров: сервис может добавить свои
+    /// фильтры поверх фильтров фронтенда не ломая логику.
     pub fn add_expand_filter<V, I>(
         mut self,
         field: &str,
@@ -398,8 +421,6 @@ impl Select {
         // NB: Will always be a FilterTree::Filter
         if let Some(ref mut f) = self.filter_list.find_with_branch(field) {
             match f {
-                // TODO: We may need to replace simple filters of the same kind
-                // but we need to check in live fire.
                 FilterTree::Filter(inner) if inner.kind == kind => {
                     inner.values.extend(values.into_iter().map(Into::into));
                 }
@@ -415,15 +436,14 @@ impl Select {
         self
     }
 
-    /// Добавляет фильтры к Select. Если они уже присутствуют, то они полностью
-    /// заменяют старые.
+    /// Полностью заменяет дерево фильтров. Старые фильтры удаляются.
     pub fn set_filter_tree(mut self, tree: FilterTree) -> Self {
         self.filter_list = tree;
         self
     }
 
-    /// This is a convenience function which applies the IN field. Since `in` is a
-    /// keyword in Rust, we use `in_any` as the function name.
+    /// Фильтр `field IN (values)`. Использует `=ANY($1)` в PostgreSQL.
+    /// Имя `in_any` вместо `in` -- чтобы не конфликтовать с ключевым словом Rust.
     pub fn in_any<V, I>(self, field: &str, values: I) -> Self
     where
         I: IntoIterator<Item = V>,
@@ -432,8 +452,7 @@ impl Select {
         self.add_expand_filter(field, SelectionKind::In, values)
     }
 
-    /// Работает аналогично [`Select::in_any`], но в случае когда values является [`Option::None`]
-    /// фильтр не будет применен
+    /// Аналог [`Select::in_any`], но пропускает фильтр если `values == None`.
     pub fn in_any_maybe<V, I>(self, field: &str, values: Option<I>) -> Self
     where
         I: IntoIterator<Item = V>,
@@ -446,7 +465,7 @@ impl Select {
         }
     }
 
-    /// a convenience function. The opposite to in any.
+    /// Фильтр `field NOT IN (values)`.
     pub fn not_in_any<V, I>(self, field: &str, values: I) -> Self
     where
         I: IntoIterator<Item = V>,
@@ -455,11 +474,12 @@ impl Select {
         self.add_expand_filter(field, SelectionKind::NotIn, values)
     }
 
-    /// This is a convenience function which checks the field for equality.
+    /// Фильтр `field = value`.
     pub fn eq<I: Into<Value>>(self, field: &str, value: I) -> Self {
         self.add_expand_filter(field, SelectionKind::Equals, [value])
     }
 
+    /// Аналог [`Select::eq`], но пропускает фильтр если `value == None`.
     pub fn eq_maybe<I: Into<Value>>(self, field: &str, value: Option<I>) -> Self {
         if let Some(value) = value {
             self.add_expand_filter(field, SelectionKind::Equals, [value])
@@ -468,12 +488,12 @@ impl Select {
         }
     }
 
-    /// This is a convenience function which checks the field for inequality.
+    /// Фильтр `field != value`.
     pub fn ne<I: Into<Value>>(self, field: &str, value: I) -> Self {
         self.add_expand_filter(field, SelectionKind::NotEquals, [value])
     }
 
-    /// Фильтр на [`SelectionKind::LessEqual`]
+    /// Фильтр [`SelectionKind::LessEqual`]: `field <= value`.
     pub fn less_eq<I>(self, field: &str, value: I) -> Self
     where
         I: Into<Value>,
@@ -481,7 +501,7 @@ impl Select {
         self.add_expand_filter(field, SelectionKind::LessEqual, [value])
     }
 
-    /// Фильтр на [`SelectionKind::Greater`]
+    /// Фильтр [`SelectionKind::Greater`]: `field > value`.
     pub fn greater<I>(self, field: &str, value: I) -> Self
     where
         I: Into<Value>,
@@ -489,8 +509,7 @@ impl Select {
         self.add_expand_filter(field, SelectionKind::Greater, [value])
     }
 
-    /// This is a convenience function which creates a select for all fields in the
-    /// table while applying an in filter.
+    /// Создаёт Select со всеми полями таблицы и фильтром `field IN (values)`.
     pub fn full_in<I: IntoIterator<Item = Value>, T: DbItem>(
         field: &str,
         values: I,
@@ -498,6 +517,7 @@ impl Select {
         Self::full::<T>().in_any::<_, I>(field, values)
     }
 
+    /// Фильтр ILIKE/`~` по нескольким полям одновременно (OR между полями).
     pub fn fields_containing<I, T, S>(mut self, fields: I, like: S) -> Self
     where
         I: IntoIterator<Item = T>,
@@ -515,6 +535,7 @@ impl Select {
         self
     }
 
+    /// Фильтр `field && values` (перекрытие массивов PostgreSQL).
     pub fn array_overlaps<V>(mut self, field: &str, values: V) -> Self
     where
         V: Into<Value>,
@@ -527,9 +548,10 @@ impl Select {
         self
     }
 
-    /// This adds an ordering to the select. The behavior should be as follows:
-    /// 1. If the ordering exists for a column it replaces it.
-    /// 2. If the ordering does not exist, it adds it.
+    /// Добавляет или заменяет сортировку по полю.
+    ///
+    /// Если поле уже есть в `order_list` -- заменяет направление.
+    /// Если нет -- добавляет в конец.
     pub fn add_replace_order(
         mut self,
         field: &str,
@@ -541,7 +563,6 @@ impl Select {
             *order = new_order;
             return self;
         }
-        // If we don't already have that sort order, we add ours.
         self.order_list.push(FieldSortOrder {
             field: field.to_owned(),
             order: new_order,
@@ -550,23 +571,23 @@ impl Select {
         self
     }
 
-    /// Convenience form of `add_replace_order`. ORDER BY field ASC
+    /// Добавляет/заменяет сортировку по возрастанию.
     pub fn add_replace_order_asc(self, field: &str) -> Self {
         self.add_replace_order(field, FieldSortKind::Asc)
     }
 
-    /// Convenience form of `add_replace_order`. ORDER BY field DESC
+    /// Добавляет/заменяет сортировку по убыванию.
     pub fn add_replace_order_desc(self, field: &str) -> Self {
         self.add_replace_order(field, FieldSortKind::Desc)
     }
 
-    /// Определение порядка NULL значений при сортировке по всем полям
+    /// Устанавливает позицию NULL для всех полей сортировки.
     pub fn with_null_position(mut self, pos: NullPosition) -> Self {
         self.order_list.iter_mut().for_each(|o| o.null_position = Some(pos));
         self
     }
 
-    /// Установление правильной позиции для каждой сортировки:
+    /// Устанавливает позицию NULL в соответствии с направлением сортировки:
     ///
     /// * При [`FieldSortKind::Asc`] будет установлено [`NullPosition::First`]
     /// * При [`FieldSortKind::Desc`] будет установлено [`NullPosition::Last`]
@@ -580,89 +601,93 @@ impl Select {
         self
     }
 
-    /// При сортировке по каждому полю NULL значения будут идти первыми
+    /// При сортировке по каждому полю NULL значения будут идти первыми.
     pub fn with_nulls_first(self) -> Self {
         self.with_null_position(NullPosition::First)
     }
 
-    /// При сортировке по каждому полю NULL значения будут идти последними
+    /// При сортировке по каждому полю NULL значения будут идти последними.
     pub fn with_nulls_last(self) -> Self {
         self.with_null_position(NullPosition::Last)
     }
 
-    /// This function exists to extract a filter based on a field.
-    /// This is useful for Sections and in general when changing criteria.
+    /// Удаляет все фильтры по заданному полю и возвращает их.
+    ///
+    /// Используется когда нужно перехватить фильтры фронтенда и заменить
+    /// их на другие (например, переконвертировать в jsonpath).
     pub fn remove_filters_by_field(&mut self, field: &str) -> Vec<Filter> {
         self.filter_list.remove_by_field(field)
     }
 
-    /// Fetch only the first record.
+    /// Ограничивает выборку первой записью.
     pub fn take_first(mut self) -> Self {
         self.take_n = Some(1);
         self
     }
 
-    /// Skip the first N records.
+    /// Пропускает первые `n` записей.
     pub fn offset(mut self, n: usize) -> Self {
         self.offset = Some(n);
         self
     }
 
-    /// Take only N records.
+    /// Берёт не более `n` записей.
     pub fn take_n(mut self, n: usize) -> Self {
         self.take_n = Some(n);
         self
     }
 
-    /// Skip the first N records.
+    /// Устанавливает offset из Option -- удобно когда источник сам опциональный.
     pub fn offset_maybe(mut self, n: Option<usize>) -> Self {
         self.offset = n;
         self
     }
 
+    /// Включает или выключает подсчёт общего числа строк при пагинации.
     pub fn count_total(mut self, v: bool) -> Self {
         self.count_total = Some(v);
         self
     }
 
-    /// Take only N records.
+    /// Устанавливает take_n из Option.
     pub fn take_n_maybe(mut self, n: Option<usize>) -> Self {
         self.take_n = n;
         self
     }
 
-    /// Clears pagination parameters.
+    /// Сбрасывает параметры пагинации (offset и take_n).
     pub fn clear_pagination(&mut self) {
         self.take_n = None;
         self.offset = None;
     }
 
-    /// Gets the field as a `Vec<&str>`/ This is useful for defining the return
-    /// fields
+    /// Возвращает список полей как срез строк.
     pub fn fields(&self) -> Vec<&str> {
         self.field_list.iter().map(|x| x as &str).collect::<Vec<&str>>()
     }
 
-    /// Add DISTINCT ON clause. If we have an ORDER BY clause, we should remember
-    /// that the distinct fields should also be in the ORDER BY clause.
-    /// The order of the ORDER BY fields is critically important in getting your query
-    /// correct in this case.
+    /// Добавляет DISTINCT ON по указанным полям.
+    ///
+    /// При наличии ORDER BY поля DISTINCT ON обязаны быть первыми в нём,
+    /// иначе PostgreSQL вернёт ошибку.
     pub fn distinct_on<I: Display>(mut self, fields: &[I]) -> Self {
         self.distinct_on = fields.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         self
     }
 
-    /// Очистка селекта от полей, которых нет в репрезентации сущности
+    /// Возвращает копию Select, оставив только поля, известные адаптору `T`.
     pub fn filtered_copy_for<T: DbAdaptor>(&self) -> Self {
         self.filtered_copy(T::DbItem::FIELDS.iter().chain(T::DUP_FIELDS).copied())
     }
 
-    /// Разделение селекта на два, в одном -- поля указанной сущности, в другом -- все остальное.
+    /// Разбивает Select на два: в первом -- поля сущности `T`, во втором -- остальное.
+    ///
+    /// Полезно при обработке составного запроса с несколькими сущностями.
     pub fn split_for<T: DbAdaptor>(self) -> (Self, Self) {
         self.filtered_split(T::DbItem::FIELDS.iter().chain(T::DUP_FIELDS).copied())
     }
 
-    /// Очистка селекта от полей, которых нет в переданном `fields` массиве
+    /// Возвращает копию Select, оставив только поля из `fields`.
     pub fn filtered_copy<'a, I>(&self, fields: I) -> Self
     where
         I: IntoIterator<Item = &'a str>,
@@ -671,8 +696,6 @@ impl Select {
         q.skip_main_check = true;
 
         let fields = fields.into_iter().collect::<AHashSet<&str>>();
-        // Check that fields are ok. (NB: We do not need any complex checks here
-        // since the fields are predefined by the table.
         q.field_list = q
             .field_list
             .into_iter()
@@ -693,7 +716,7 @@ impl Select {
         q
     }
 
-    /// Разбиение селекта на два, в одном -- поля из `fields`, в другом -- остальные.
+    /// Разбивает Select на два: в первом -- поля из `fields`, во втором -- остальные.
     pub fn filtered_split<'a, I>(self, fields: I) -> (Self, Self)
     where
         I: IntoIterator<Item = &'a str>,
@@ -701,8 +724,6 @@ impl Select {
         let (mut one, mut two) = (Select::default(), Select::default());
 
         let fields = fields.into_iter().collect::<AHashSet<&str>>();
-        // Check that fields are ok. (NB: We do not need any complex checks here
-        // since the fields are predefined by the table.
 
         (one.field_list, two.field_list) =
             self.field_list.into_iter().partition(|x| fields.contains(x.as_str()));
@@ -719,8 +740,13 @@ impl Select {
     }
 }
 
+/// Имя псевдоколонки для результата `COUNT(*) OVER()` при пагинации.
 const TOTAL_COUNT: &str = "_total_count";
 
+/// Обёртка для строки с добавленным полем `_total_count`.
+///
+/// `FromRow` читает и сам элемент и счётчик из одной строки результата,
+/// чтобы не делать второй запрос `SELECT COUNT(*)`.
 pub(crate) struct WithCount<T> {
     item: T,
     total_count: i64,

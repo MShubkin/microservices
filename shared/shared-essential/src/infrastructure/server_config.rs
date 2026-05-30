@@ -2,10 +2,16 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-/// Конфигурация сервера
+/// Снимок переменных окружения сервиса для диагностического endpoint-а.
+///
+/// `BTreeMap` (а не `HashMap`) — чтобы переменные в ответе шли в алфавитном порядке,
+/// это удобно при ручном просмотре конфига в логах или в Swagger UI.
+///
+/// По умолчанию (без feature `show_passwords`) значения переменных, заканчивающихся
+/// на `PASS` или `PASSWORD`, маскируются звёздочками — чтобы конфиг можно было
+/// безопасно вывести в лог или вернуть через debug-endpoint.
 #[derive(Debug, Default, Serialize)]
 pub struct ServerConfig {
-    /// Переменные среды
     env_vars: BTreeMap<String, String>,
 }
 

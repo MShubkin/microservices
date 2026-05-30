@@ -9,6 +9,11 @@ use tokio::sync::{Mutex, OnceCell};
 
 use crate::id_pool::FreeId;
 
+/// Возвращает пул для БД с суффиксом `suffix` (например, `dbname_3`).
+///
+/// Пулы кешируются в `POOLS` — повторный вызов с тем же суффиксом отдаёт
+/// тот же `Arc<PgPool>` без нового подключения. Мьютекс нужен, потому что
+/// несколько тестов могут одновременно запросить пул для нового суффикса.
 pub(crate) async fn get_test_pool(
     suffix: u16,
 ) -> Result<Arc<PgPool>, SharedDbError> {
@@ -29,6 +34,11 @@ pub(crate) async fn get_test_pool(
     }
 }
 
+/// Сбрасывает схему и применяет миграции заново.
+///
+/// `DROP SCHEMA CASCADE` убивает все таблицы, индексы, типы и функции за один запрос.
+/// Это быстрее, чем перебирать объекты по одному. После — чистый `CREATE SCHEMA public`
+/// и прогон миграций из `source`.
 pub(crate) async fn migrate_db<'s, M>(
     pool: &PgPool,
     source: M,
@@ -36,7 +46,6 @@ pub(crate) async fn migrate_db<'s, M>(
 where
     M: MigrationSource<'s>,
 {
-    // clean up DB
     sqlx::query("DROP SCHEMA public CASCADE").execute(pool).await?;
     sqlx::query("CREATE SCHEMA public").execute(pool).await?;
 
@@ -92,10 +101,12 @@ where
     Ok(())
 }
 
-/// Apply SQL script `sql` to the DB connected with `pool`.
+/// Применяет произвольный SQL-скрипт как временную миграцию, затем удаляет запись о ней.
 ///
-/// We use sqlx migrations functionality, applying `sql` as a migration,
-/// but right after that deleting the record from _sqlx_migrations.
+/// Хак с `_sqlx_migrations`: sqlx требует уникальный версионный номер для каждой миграции.
+/// Используем `99999999000000` — заведомо больше любого реального номера, чтобы не конфликтовать.
+/// После применения сразу удаляем запись, чтобы тот же скрипт можно было применить ещё раз
+/// в другом тесте.
 pub(crate) async fn apply_sql<S: Into<Cow<'static, str>>>(
     pool: &PgPool,
     sql: S,
@@ -116,6 +127,13 @@ pub(crate) async fn apply_sql<S: Into<Cow<'static, str>>>(
     Ok(())
 }
 
+/// Подготавливает БД для теста: при первом использовании применяет миграции,
+/// при повторном — только TRUNCATE таблиц, которые были пустыми после миграций.
+///
+/// Логика `is_new()`: если `FreeId` взят из пула (уже использовался), значит
+/// миграции уже применены. Нужно только очистить данные предыдущего теста.
+/// Список "пустых после миграций таблиц" хранится отдельно, чтобы не TRUNCATE-ить
+/// таблицы со справочниками, которые мигрировались с данными.
 pub(crate) async fn prepare_for_test<'s, M>(
     migrations: Option<M>,
 ) -> Result<(Arc<PgPool>, FreeId), SharedDbError>
@@ -172,7 +190,11 @@ where
     Ok((pool, id))
 }
 
-/// Track empty tables per connection to clean up after tests
+/// Реестр "изначально пустых" таблиц по суффиксу БД.
+///
+/// Хранит список таблиц, которые были пустыми сразу после миграций.
+/// Только они TRUNCATE-ируются между тестами — таблицы со справочными данными
+/// из миграций остаются нетронутыми.
 mod empty_tables {
     use asez2_shared_db::ahash::AHashMap;
     use tokio::sync::{OnceCell, RwLock};

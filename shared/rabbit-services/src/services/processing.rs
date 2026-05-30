@@ -1,3 +1,4 @@
+//! Клиент RabbitMQ для сервиса Processing (обработка ППЗ и ДС).
 use std::fmt::Debug;
 use std::{sync::Arc, time::Duration};
 

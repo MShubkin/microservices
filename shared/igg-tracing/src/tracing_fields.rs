@@ -2,6 +2,9 @@ use std::{fmt::Display, net::SocketAddr, ops::Deref, str::FromStr};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+// Имена полей span-а с пространством имён `asez.` — это предотвращает конфликты
+// с полями стандартных библиотек (actix-web, tower и т.д.) в случае их объединения
+// в одном subscriber. Использование констант вместо литералов исключает опечатки.
 pub const USER_ID: &str = "asez.user_id";
 pub const USER_NAME: &str = "asez.user_name";
 pub const REQUEST_ID: &str = "asez.request_id";
@@ -19,7 +22,13 @@ pub const TIMESTAMP: &str = "asez.timestamp";
 /// Might be some user friendly, like String (e.g. uri + timestamp), or Uuid.
 pub type RequestId = Uuid;
 
-/// Utility type that wraps vec of items and displays them comma-separated.
+/// Вектор значений с отображением через запятую.
+///
+/// Используется для полей `object_ids` и `object_uuids` в CEF Extension,
+/// где несколько идентификаторов нужно упаковать в одно строковое поле.
+/// `Deref<Target=Vec<T>>` предоставляет методы чтения без лишнего кода.
+/// `DerefMut` намеренно не реализован — изменение производится через `set_*`-методы
+/// `AsezTracingFieldsCollection` с явной семантикой.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommaList<T>(pub Vec<T>);
 
@@ -63,7 +72,17 @@ impl<T: FromStr> FromStr for CommaList<T> {
     }
 }
 
-/// Collection of data that is used for tracing events.
+/// Набор полей для распределённой трассировки одного HTTP-запроса в АСЭЗ.
+///
+/// Создаётся в middleware (`AsezSessionWatcher`, `AsezTracingFields`) при входящем
+/// запросе и помещается в `req.extensions()`. Оттуда его достаёт:
+/// - `ServiceRootSpanBuilder` — для записи в корневой tracing span
+/// - Реализации `FromRequest` для RabbitMQ-сервисов — для пропагации контекста
+///   в межсервисные вызовы через `AsezRabbitProperties`
+///
+/// Опциональные поля (`user_id`, `user_name`, `object_ids`, `object_uuids`)
+/// заполняются последовательно разными middleware и могут оставаться `None`/пустыми,
+/// если соответствующий middleware не был вызван или данные недоступны.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AsezTracingFieldsCollection {
     pub request_id: RequestId,
@@ -73,8 +92,11 @@ pub struct AsezTracingFieldsCollection {
 
     pub user_id: Option<i32>,
     pub user_name: Option<String>,
+    /// Числовые идентификаторы бизнес-объектов, затронутых запросом.
     pub object_ids: CommaList<i64>,
+    /// UUID-идентификаторы бизнес-объектов (альтернативный ключ).
     pub object_uuids: CommaList<Uuid>,
+    /// Время получения запроса — фиксируется при создании, не изменяется.
     pub timestamp: OffsetDateTime,
 }
 
@@ -123,6 +145,17 @@ impl AsezTracingFieldsCollection {
     }
 }
 
+/// Создаёт `tracing::Span` с полями АСЭЗ из `Option<AsezTracingFieldsCollection>`.
+///
+/// Используется при создании дочерних span-ов в RabbitMQ-обработчиках,
+/// где нет `ServiceRootSpanBuilder` (в отличие от HTTP-хэндлеров).
+/// Если коллекция полей отсутствует — создаёт пустой span без полей АСЭЗ.
+///
+/// # Пример
+/// ```rust,ignore
+/// let span = span_with_fields!(fields.as_ref(), "process_rabbit_message");
+/// async move { ... }.instrument(span).await;
+/// ```
 #[macro_export]
 macro_rules! span_with_fields {
     ($fields:expr, $name:expr) => {

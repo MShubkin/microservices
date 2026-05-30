@@ -276,7 +276,6 @@ where
         // Если значения в поле "Раздел плана" различается и равно 4.3  (11) и 4.6 (14),
         // то переходим к следующей проверке, иначе формируем сообщение
         if s43 != 0 && s46 != 0 && gpk.len() != s43 + s46 {
-            println!("ТУТ 1");
             return Err(AgendaPricingUnitCheck::DifferentSections);
         }
 
@@ -284,7 +283,6 @@ where
         // section_id = 11 или 14, а по остальным ППЗ/ДС значение section_id ≠ 11 или 14,
         // то переходим к следующей проверке, иначе формируем сообщение
         if (s43 != 0 || s46 != 0) && gpk.len() != s43 + s46 {
-            println!("ТУТ 2");
             return Err(AgendaPricingUnitCheck::DifferentSections);
         }
     }

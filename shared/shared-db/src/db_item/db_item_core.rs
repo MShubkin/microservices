@@ -10,13 +10,19 @@ use crate::result::{Result, SharedDbError};
 
 use std::fmt::Debug;
 
+/// Максимальное количество привязанных параметров в одном запросе PostgreSQL.
+/// Ограничение протокола: номер placeholder `$N` кодируется u16.
 pub const MAX_BINDINGS: usize = u16::MAX as usize;
-/// If we use UNNEST queries on very large datasets, postgres
-/// will use a very large amount of RAM, which is unacceptable.
+
+/// При UNNEST-обновлениях на очень больших наборах данных PostgreSQL может
+/// потребить огромное количество RAM. Ограничиваем количество строк на одну
+/// операцию этой константой.
 pub const UPDATE_UNNEST_VALUES: usize = 1_000_000;
 const RETURNING: &str = " returning *";
 
-/// This is part of the mechanism for simple return.
+/// Используется для унификации insert/update -- один и тот же метод умеет
+/// возвращать либо количество затронутых строк, либо сами строки,
+/// в зависимости от флага `returning`.
 #[derive(Debug)]
 pub enum ReturningEither<T: DbItem> {
     RowsAffected(u64),
@@ -24,6 +30,7 @@ pub enum ReturningEither<T: DbItem> {
 }
 
 impl<T: DbItem> ReturningEither<T> {
+    /// Создаёт пустой контейнер нужного варианта по флагу `returning`.
     pub fn new(returning: bool) -> Self {
         match returning {
             false => Self::RowsAffected(0),
@@ -32,26 +39,29 @@ impl<T: DbItem> ReturningEither<T> {
     }
 }
 
-/// Paginaged response from DB.
+/// Ответ от БД с поддержкой пагинации.
 pub struct Paginated<T> {
-    /// Chunk of items.
+    /// Срез элементов текущей страницы.
     pub items: Vec<T>,
-    /// Optional total count of items, as if returned without pagination.
+    /// Полное количество строк без учёта пагинации (только если запрошено).
     pub total: Option<i64>,
 }
 
+/// Псевдоним для типизированного запроса sqlx с параметрами Postgres.
 pub type BindQuery<'a> =
     Query<'a, Postgres, <Postgres as HasArguments<'a>>::Arguments>;
 
 #[async_trait::async_trait]
-/// This is a boiler plate trait that automatically implements utility functions to insert, update
-/// and fetch items that implement it from a Postgres database via sqlx.
+/// Основной трейт CRUD-доступа к таблице PostgreSQL.
 ///
-/// Currently the `db_item!` macro automatically creates the structure and implements the
-/// required functions of the trait for you, although in future it may be changed to become
-/// a proc macro.
+/// Реализуется через proc-macro `#[derive(DbItem)]`, которая по полям структуры
+/// и атрибутам генерирует константы (`TABLE`, `FIELDS`, `PRIMARY_KEYS`, …)
+/// и методы привязки значений к запросам.
 ///
-/// NB: The `Unpin` bound is needed to be able to use `Query::map` in selection (and in general).
+/// Каждая структура привязана ровно к одной таблице. Первичный ключ может быть
+/// составным -- несколько полей с атрибутом `#[item_field_pkey]`.
+///
+/// Ограничение `Unpin` нужно для `Query::map` в операциях выборки.
 pub trait DbItem:
     FieldTolerance
     + for<'d> sqlx::FromRow<'d, PgRow>
@@ -61,87 +71,81 @@ pub trait DbItem:
     + Sync
     + Unpin
 {
-    /// Each type of item has a table that it belongs to.
+    /// Имя таблицы в PostgreSQL.
     const TABLE: &'static str;
-    /// NB: A table can have multiple keys, eg (id_field, other_id_field)
+    /// Имена колонок первичного ключа.
     const PRIMARY_KEYS: &'static [&'static str];
-    /// This constant contains row names where this item belongs.
+    /// Имена всех колонок таблицы.
     const FIELDS: &'static [&'static str];
-    /// Indices of fields in [Self::FIELDS] that are primary keys of the table.
+    /// Индексы первичных ключей в массиве `FIELDS`.
+    ///
+    /// Нужны для быстрой работы с [`DbFieldMask`] без поиска по строкам.
     const PRIMARY_KEY_INDICES: &'static [usize];
-    /// This constant contains fields that are not automatically generated and is used for
-    /// inserting a new structure into the DB.
+    /// Поля, которые вставляются при INSERT (без autogen-колонок).
     const INSERT_FIELDS: &'static [&'static str];
-    /// This constant includes only fields that can be updated.
+    /// Поля, доступные для UPDATE (без `GENERATED ALWAYS AS` колонок).
     const UPDATE_FIELDS: &'static [&'static str];
-    /// Indices of fields in [Self::FIELDS] that shouldn't be updated
-    /// (currently, fields that have `GENERATED ALWAYS AS ...` SQL constraint).
+    /// Индексы полей в `FIELDS`, которые нельзя обновлять (GENERATED ALWAYS AS).
     const NO_UPDATE_INDICES: &'static [usize];
 
-    /// Get the structure's primary key. Since the key can come as a flavour of integer,
-    /// or as a string, we try to be value here.
-    /// Since tables may change over time, we try to be flexible.
-    /// This converts the structure into fields and binds to a query.
+    /// Привязывает только первичные ключи структуры к запросу.
+    /// Используется в WHERE-части UPDATE/DELETE.
     fn bind_pkeys<'a>(&'a self, query: BindQuery<'a>) -> BindQuery<'a>;
 
-    /// This converts the structure into fields and binds to a query. If autogenerated fields
-    /// are present it is recommended to call `bind_to_query_insert` and then add extra fields.
+    /// Привязывает все поля структуры к запросу в порядке `FIELDS`.
     fn bind_to_query<'a>(&'a self, query: BindQuery<'a>) -> BindQuery<'a>;
 
-    /// This converts the structure into fields and binds to a query, however it
-    /// does not bind autogen fields.
+    /// Привязывает только insertable-поля (без autogen).
+    /// Вызывается при формировании INSERT.
     fn bind_to_query_insert<'a>(&'a self, query: BindQuery<'a>) -> BindQuery<'a>;
 
-    /// Bind only fields that are specified. This is useful when updating a limited
-    /// number of fields in a large table. This function should be used with care.
+    /// Привязывает только поля, выбранные маской.
+    ///
+    /// Применяется при частичном обновлении, когда нет смысла передавать
+    /// в запрос значения полей, которые не меняются.
     fn bind_limited_fields<'a>(
         &'a self,
         query: BindQuery<'a>,
         mask: &DbFieldMask<Self>,
     ) -> BindQuery<'a>;
 
-    /// Sometimes an item may have fields with information that is invalid for certain
-    /// DB operations but not others. In that case those fields need to be activated
-    /// with some values beforehand. Generally default values. This function exists
-    /// in order to do so.
+    /// Заполняет поля значениями перед INSERT, если они равны `Default::default()`.
+    ///
+    /// Нужен для полей, у которых в Rust нет валидного дефолта для БД
+    /// (например, `Option::None` в NOT NULL колонку) или где нужно
+    /// проставить `now()` вместо дефолтной даты.
     fn activate_fields(&mut self);
 
-    /// Converts the fields array into an array ready for insertion
-    /// eg `["id", "name", "address"] becomes `"id,name,address"`.
-    /// This method is provided.
-    /// TODO: Convert into proc macro.
+    /// Возвращает все поля через запятую: `"id,name,address"`.
+    /// TODO: Перенести в proc-macro.
     fn fields_string() -> String {
         Self::FIELDS.join(",")
     }
 
-    /// As `DbItem::fields_string` but for inserted fields only.
+    /// Возвращает insertable-поля через запятую.
     fn insert_fields_string() -> String {
         Self::INSERT_FIELDS.join(",")
     }
 
-    /// Converts the field array into a representation of the bindings.
-    ///
-    /// The `nth` argument tells us which item this is in the list that the counter may
-    /// be adjusted correctly.
-    /// eg `["id", "name", "address"] becomes `"($1,$2,$3)"`.
-    /// TODO: Convert into a proc macro.
+    /// Возвращает строку placeholder'ов для n-й строки VALUES.
+    /// Например: `"($1,$2,$3)"` для `nth=0`.
+    /// TODO: Перенести в proc-macro.
     fn field_counter(nth: usize) -> String {
         field_counter(Self::FIELDS, nth)
     }
 
-    /// Count only the fields that are normally inserted (not for use with update or query)
-    /// This needs to be different from `field_counter` only if there are autogenerated fields
-    /// which are not usually inserted, but whose values are created/incremented by the DB.
+    /// Аналог [`field_counter`], но только для insertable-полей.
+    ///
+    /// Отличается от `field_counter` только когда есть autogen-поля,
+    /// которые не вставляются вручную.
     fn insert_field_counter(nth: usize) -> String {
         field_counter(Self::INSERT_FIELDS, nth)
     }
 
-    /// This inserts an item into its table.
+    /// Вставляет одну запись в таблицу.
     ///
-    /// It is assumed that the primary key is generated on the
-    /// FRONTEND, which is incorrect. The internal implementation can be changed to NOT
-    /// insert the primary key if it is `None`/`Default::default()` on the item being
-    /// inserted without affecting the API.
+    /// Первичный ключ генерируется на стороне клиента. Возвращает
+    /// количество затронутых строк (обычно 1).
     async fn insert<'a, Ex>(&mut self, pool: Ex) -> Result<u64>
     where
         Ex: Executor<'a, Database = Postgres>,
@@ -152,7 +156,7 @@ pub trait DbItem:
         }
     }
 
-    /// This inserts an item into its table returning the inserted row. (See [`DbItem::insert`])
+    /// Вставляет запись и возвращает её из БД (с заполненными autogen-полями).
     async fn insert_returning<'a, Ex>(&mut self, pool: Ex) -> Result<Self>
     where
         Ex: Executor<'a, Database = Postgres>,
@@ -200,10 +204,10 @@ pub trait DbItem:
         }
     }
 
-    /// Update a single value based on primary key.
+    /// Обновляет запись по первичному ключу.
     ///
-    /// The argument `update_fields` contains the fields to be updated.
-    /// If `update_fields` is none, then all fields will be updated.
+    /// `update_fields` -- список полей для обновления; `None` обновляет все
+    /// UPDATE_FIELDS.
     async fn update<'a, Ex>(
         &self,
         update_fields: Option<&[&str]>,
@@ -218,9 +222,7 @@ pub trait DbItem:
         }
     }
 
-    /// Update a single value based on primary key.
-    ///
-    /// The argument `update_fields` contains the field mask.
+    /// Обновляет запись по маске полей.
     async fn update_masked<'a, Ex>(
         &self,
         update_fields: DbFieldMask<Self>,
@@ -235,11 +237,12 @@ pub trait DbItem:
         }
     }
 
-    /// Update a single value based on primary key. Unlike update it returns the
-    /// updated item with the fields listed in `returning_fields`.
+    /// Обновляет запись и возвращает обновлённую версию из БД.
     ///
-    /// NB: If the item has fields with `#[item_field_require_from_row]` attribute then
-    /// `return_fields` must contain these fields, otherwise this will fail.
+    /// `return_fields` задаёт, какие поля вернуть. Если `None` -- все поля.
+    ///
+    /// Важно: если у структуры нет `#[sqlx(default)]`, то `return_fields`
+    /// обязаны включать все NOT NULL поля, иначе `FromRow` завершится ошибкой.
     async fn update_returning<'a, Ex, D: std::fmt::Display + Send + Sync>(
         &self,
         update_fields: Option<&[&str]>,
@@ -249,7 +252,7 @@ pub trait DbItem:
     where
         Ex: Executor<'a, Database = Postgres>,
     {
-        // Since the types D and &str are not "the same"...
+        // Тип D не совпадает с &str, поэтому конвертируем через String.
         let return_fields = return_fields
             .map(|x| x.iter().map(|x| x.to_string()).collect::<Vec<_>>());
         let ret_fields = match return_fields {
@@ -274,8 +277,7 @@ pub trait DbItem:
     where
         Ex: Executor<'a, Database = Postgres>,
     {
-        // It is preferable to only update selected fields, but all data in these fields
-        // must be valid.
+        // Применяем толерантные имена полей перед формированием запроса.
         let update_fields = update_fields.map(Self::apply_tolerance_to_fields);
         let return_fields = return_fields.map(Self::apply_tolerance_to_fields);
 
@@ -299,12 +301,9 @@ pub trait DbItem:
         Ex: Executor<'a, Database = Postgres>,
     {
         use ReturningEither::*;
-        // Define selected fields. We use the bind mask because it has some inbuilt
-        // guarantees.
         let selected_fields = update_fields_helper::<Self>(&update_fields);
         let field_count = field_counter(&selected_fields, 0);
 
-        // NB: This is very definitely optional.
         let return_clause = return_fields
             .map(|x| {
                 let fields = select_fields_helper::<Self>(&x);
@@ -314,6 +313,8 @@ pub trait DbItem:
 
         let fields = selected_fields.join(",");
 
+        // Для одного поля синтаксис без скобок: `field=$1`.
+        // Для нескольких: `(f1,f2)=($1,$2)`.
         let field_thread = if selected_fields.len() == 1 {
             format!("{}={}", fields, field_count)
         } else {
@@ -350,15 +351,14 @@ pub trait DbItem:
         Ok(ret)
     }
 
-    /// Inserts a vec of items into the table.
+    /// Вставляет срез записей в одной транзакции.
     ///
-    /// The approach of using a borrowed slice instead of an iterator is used,
-    /// because it allows a little bit more flexibility for the caller.
-    /// It is assumed that the performance cost of the DB call eclipses the cost
-    /// of holding the slice.
+    /// Батч разбивается на чанки так, чтобы не превышать [`MAX_BINDINGS`].
+    /// Предпочтителен вместо многократных одиночных `insert`, потому что
+    /// стоимость одного вызова БД перекрывает стоимость удержания среза.
     ///
-    /// NB: If `DbItem` is derived automatically, the derived `insert_vec` function
-    ///     differs from the default.
+    /// Если `DbItem` сгенерирован макросом и атрибут `item_aggr_insert` задан,
+    /// то реализация будет отличаться от этой дефолтной.
     async fn insert_vec(
         items: &mut [Self],
         pool: &mut sqlx::Transaction<Postgres>,
@@ -369,7 +369,7 @@ pub trait DbItem:
         }
     }
 
-    /// Inserts a vec of items into the table returning the inserted rows. (See [`DbItem::insert_vec`])
+    /// Вставляет срез записей и возвращает вставленные строки из БД.
     async fn insert_vec_returning(
         items: &mut [Self],
         pool: &mut sqlx::Transaction<Postgres>,
@@ -391,6 +391,7 @@ pub trait DbItem:
         }
         let fields = Self::insert_fields_string();
 
+        // Разбиваем на чанки по ограничению числа привязок.
         for items in items.chunks_mut(MAX_BINDINGS / fields.len()) {
             let mut query_string = format!(
                 "INSERT INTO {table} ({fields}) values{field_count}",
@@ -428,18 +429,11 @@ pub trait DbItem:
         Ok(ret)
     }
 
-    /// Updates a vec of items into the table.
+    /// Обновляет срез записей в одном запросе через VALUES + FROM.
     ///
-    /// The approach of using a borrowed slice instead of an iterator is used,
-    /// because it allows a little bit more flexibility for the caller.
-    /// It is assumed that the performance cost of the DB call eclipses the cost
-    /// of holding the slice.
-    ///
-    /// The argument `update_fields` contains the fields to be updated.
-    /// If `selected_fields` is none, then all fields will be updated.
-    ///
-    /// NB: An update always uses the primary key for finding the match.
-    /// TODO: Properly handle updates without PKey.
+    /// Использует паттерн `UPDATE t SET ... FROM (values ...) AS upd WHERE t.pk=upd.pk`.
+    /// `update_fields = None` обновляет все UPDATE_FIELDS.
+    /// Идентификация строк всегда по первичному ключу.
     async fn update_vec(
         items: &[Self],
         update_fields: Option<&[&str]>,
@@ -451,18 +445,16 @@ pub trait DbItem:
         }
     }
 
-    /// This works as `update_vec`, however, it additionally takes a list of fields
-    /// to return. And returns updated objects.
+    /// Обновляет срез записей и возвращает обновлённые строки из БД.
     ///
-    /// NB: If the item does NOT have the `#[sqlx(default)]` attribute then
-    /// `return_fields` must always be set to `None`.
+    /// Если структура не имеет `#[sqlx(default)]`, `return_fields` должен
+    /// быть `None` -- иначе `FromRow` упадёт на отсутствующих колонках.
     async fn update_vec_returning<D: std::fmt::Display + Send + Sync>(
         items: &[Self],
         update_fields: Option<&[&str]>,
         return_fields: Option<&[D]>,
         pool: &mut sqlx::Transaction<Postgres>,
     ) -> Result<Vec<Self>> {
-        // Since the types D and &str are not "the same"...
         let return_fields = return_fields
             .map(|x| x.iter().map(|x| x.to_string()).collect::<Vec<_>>());
         let ret_fields = match return_fields {
@@ -481,7 +473,9 @@ pub trait DbItem:
         }
     }
 
-    /// Presence of return fields decides whether we return fields or not.
+    /// Внутренняя реализация векторного обновления.
+    ///
+    /// Наличие `return_fields` определяет, возвращать строки или счётчик.
     async fn update_vec_inner(
         items: &[Self],
         update_fields: Option<&[&str]>,
@@ -499,22 +493,16 @@ pub trait DbItem:
         let update_fields = update_fields.map(Self::apply_tolerance_to_fields);
         let return_fields = return_fields.map(Self::apply_tolerance_to_fields);
 
-        // It is preferable to only update selected fields, but all data in these fields
-        // must be valid.
         let bind_mask = update_fields
             .as_ref()
             .map(|x| make_bind_mask::<Self>(x))
             .unwrap_or_else(|| make_bind_mask::<Self>(Self::UPDATE_FIELDS));
 
-        // Define selected fields. We use the bind mask because it has some inbuilt
-        // guarantees.
-
-        // fields that should be set by this update (fields to update sans always autogen fields)
+        // fields_to_set: то, что идёт в SET (без autogen_always).
+        // fields_to_select: то, что берётся из подзапроса VALUES (ключи + обновляемые поля).
         let fields_to_set = update_set_fields_helper::<Self>(&bind_mask);
-        // fields selected from the value list (keys + values to set to)
         let fields_to_select = select_fields_helper::<Self>(&bind_mask);
 
-        // NB: This is very definitely optional.
         let return_clause = return_fields
             .map(|x| {
                 let bind_mask = make_bind_mask::<Self>(&x);
@@ -527,17 +515,14 @@ pub trait DbItem:
             .unwrap_or_default();
 
         for items in items.chunks(MAX_BINDINGS / fields_to_select.len()) {
-            // Gives us `($1,$2,$3..)`
+            // Строим список placeholder'ов для всех строк.
             let mut field_counts = field_counter(&fields_to_select, 0);
             for i in 1..items.len() {
-                // The next two lines should together add `,($4,$5,$6..)`
-                // The numbers increment by the number of fields each time.
                 field_counts.push(',');
                 field_counts.push_str(&field_counter(&fields_to_select, i));
             }
 
-            // The final result of the next block should look like:
-            // `field_a=upd.field_a,field_b=upd_field_b,field_c=upd.field_c`
+            // `SET field_a=upd.field_a, field_b=upd.field_b, ...`
             let field_mapping = fields_to_set
                 .iter()
                 .map(|x| format!("{f}={upd}.{f}", upd = upd, f = x))
@@ -585,10 +570,12 @@ pub trait DbItem:
         Ok(ret)
     }
 
-    /// This selects items from the table based on criteria and using the `Select` structure. Simple filtration
-    /// operations as well as ordering and selection of specific fields is also possible.
-    /// Trying to specify fields in the wrong order may cause an error to be returned, since the return structure
-    /// is not flexible in the order of fields.
+    /// Выбирает строки по параметрам из [`Select`].
+    ///
+    /// Поля указаны через `Select::with_fields([Entity::field_name])` --
+    /// compile-time константы, сгенерированные `#[derive(DbItem)]`.
+    /// Порядок полей в `field_list` должен совпадать с порядком в структуре,
+    /// иначе `FromRow` вернёт ошибку декодирования.
     async fn select<'a, Ex>(q: &Select, pool: Ex) -> Result<Vec<Self>>
     where
         Ex: Executor<'a, Database = Postgres>,
@@ -601,10 +588,7 @@ pub trait DbItem:
             .await
     }
 
-    /// This selects a single item from the table based on criteria and using the `Select` structure. Simple filtration
-    /// operations as well as ordering and selection of specific fields is also possible.
-    /// Trying to specify fields in the wrong order may cause an error to be returned, since the return structure
-    /// is not flexible in the order of fields.
+    /// Выбирает ровно одну строку. Ошибка если нет строк или больше одной.
     async fn select_single<'a, Ex>(q: &Select, pool: Ex) -> Result<Self>
     where
         Ex: Executor<'a, Database = Postgres>,
@@ -626,10 +610,7 @@ pub trait DbItem:
         }
     }
 
-    /// This selects possibly a single item from the table based on criteria and using the `Select` structure. Simple filtration
-    /// operations as well as ordering and selection of specific fields is also possible.
-    /// Trying to specify fields in the wrong order may cause an error to be returned, since the return structure
-    /// is not flexible in the order of fields.
+    /// Выбирает не более одной строки. Ошибка если больше одной.
     async fn select_option<'a, Ex>(q: &Select, pool: Ex) -> Result<Option<Self>>
     where
         Ex: Executor<'a, Database = Postgres>,
@@ -648,7 +629,10 @@ pub trait DbItem:
         }
     }
 
-    /// This function exists mostly for tests where we want to painlessly extract all records from a table
+    /// Выбирает все строки таблицы без фильтров.
+    ///
+    /// Предназначен для тестов, где нужно быстро получить полное содержимое
+    /// таблицы без настройки `Select`.
     async fn select_all<'a, Ex>(pool: Ex) -> Result<Vec<Self>>
     where
         Ex: Executor<'a, Database = Postgres>,
@@ -662,16 +646,12 @@ pub trait DbItem:
             .await
     }
 
-    /// This function performs recursive select for the current table.
+    /// Рекурсивный SELECT через `WITH RECURSIVE`.
     ///
-    /// The `initial_select` is used to select initial values.
-    ///
-    /// On each recursion step new rows are selected using their field named `new_item_field`
-    /// that should have the same values as values of the field named `existing_item_field` of previously found rows.
-    ///
-    /// When no more rows are found, the resulting rows are processed using `final_select` query.
-    ///
-    /// Note that this select detects cycles in data, but do not report them.
+    /// Стартует с `initial_select`, затем итеративно добирает строки,
+    /// у которых `new_item_field` совпадает с `existing_item_field` уже
+    /// найденных строк. Циклы обнаруживаются через `CYCLE ... SET is_cycle`.
+    /// Финальный набор строк обрабатывается через `final_select`.
     async fn select_recursive<'a, Ex>(
         initial_select: &Select,
         existing_item_field: &str,
@@ -730,6 +710,11 @@ WITH RECURSIVE {rec_table} AS (
             .map_err(Into::into)
     }
 
+    /// Выбирает страницу записей с опциональным подсчётом total через оконную функцию.
+    ///
+    /// `Select` обязан содержать `offset`, `take_n` и `count_total`.
+    /// Если `count_total == true`, запрос включает `COUNT(*) OVER()` и возвращает
+    /// полное количество строк без повторного запроса к БД.
     async fn select_paginated<'a, Ex>(
         select: &Select,
         pool: Ex,
@@ -776,8 +761,10 @@ WITH RECURSIVE {rec_table} AS (
     }
 }
 
-/// Marker trait for DbItem structs that can be built from
-/// subset of fields.
+/// Маркерный трейт: структура может быть десериализована из неполного набора колонок.
 ///
-/// Implementation is generated along with derived `DbItem` if no `item_field_required` attribute is applied.
+/// Генерируется автоматически вместе с `#[derive(DbItem)]`, если ни одно поле
+/// не помечено `#[item_field_required]`. При наличии таких полей трейт не генерируется,
+/// и попытка использовать структуру в `Select` с неполным списком полей приведёт
+/// к ошибке компиляции.
 pub trait DbItemPartialSelect {}

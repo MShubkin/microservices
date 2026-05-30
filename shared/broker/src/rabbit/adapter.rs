@@ -27,12 +27,16 @@ use crate::{
     BrokerAdapter, BrokerError, Consumer,
 };
 
-/// Адаптер подключения к RabbitMQ серверу
+/// Адаптер подключения к RabbitMQ серверу.
+///
+/// Хранит одно TCP-соединение; каналы открываются поверх него по требованию.
+/// `Clone` делегируется в `amqprs::Connection`, которое само по себе является
+/// дешёвым хэндлом (Arc внутри) — клонирование не дублирует сокет.
 #[derive(Clone)]
 pub struct RabbitAdapter {
     /// Подключение к RabbitMQ серверу
     connection: Connection,
-    /// Аргументы для механизма ретрая
+    /// Аргументы ретрая пробрасываются во все дочерние каналы, консьюмеры и паблишеры.
     retry_args: RetryArgs,
 }
 
@@ -61,6 +65,8 @@ impl BrokerAdapter for RabbitAdapter {
             BrokerError::from(err)
         })?;
 
+        // `DefaultConnectionCallback` обрабатывает heartbeat и Close-события от брокера.
+        // Без регистрации колбэка соединение будет разорвано сервером при первом heartbeat-тайм-ауте.
         connection.register_callback(DefaultConnectionCallback).await.map_err(
             |err| {
                 #[cfg(feature = "traces")]
@@ -79,6 +85,8 @@ impl BrokerAdapter for RabbitAdapter {
     }
 
     async fn open_channel(&self, channel_id: Option<u16>) -> Result<Self::Channel> {
+        // При `None` braker назначает channel_id сам; конкретный id нужен только при
+        // ручном управлении мультиплексированием (сейчас не используется).
         let channel_open_op = || self.connection.open_channel(channel_id);
         let channel =
             channel_open_op.retry(&self.retry_args).await.map_err(|err| {
@@ -87,6 +95,7 @@ impl BrokerAdapter for RabbitAdapter {
                 BrokerError::from(err)
             })?;
 
+        // `DefaultChannelCallback` обрабатывает Flow и Close-события от брокера на уровне канала.
         let register_callback_op =
             || channel.register_callback(DefaultChannelCallback);
         register_callback_op.retry(&self.retry_args).await.map_err(|err| {
@@ -104,6 +113,8 @@ impl BrokerAdapter for RabbitAdapter {
     }
 
     async fn declare_queue(&self, args: Self::QueueArgs) -> Result<()> {
+        // Для декларации очереди открывается временный канал, который закрывается сразу после.
+        // Долгоживущий канал здесь не нужен — декларация идемпотентна и выполняется один раз при старте.
         let rabbit_channel = self.open_channel(None).await?;
         rabbit_channel.channel.queue_declare(args).await.map_err(|err| {
             #[cfg(feature = "traces")]
@@ -145,9 +156,14 @@ impl BrokerAdapter for RabbitAdapter {
     }
 }
 
-/// Обертка для воссоздания RPC паттерна с помощью Direct-Reply механизма.
-/// Создает [RabbitPublisher] и [RabbitConsumer] на одном
-/// и том же канале и возвращает их как долгоживущие сущности.
+/// Обёртка для RPC через AMQP Direct Reply-to.
+///
+/// Publisher и Consumer намеренно разделены на два поля, но живут на одном канале:
+/// AMQP требует, чтобы подписка на `amq.rabbitmq.reply-to` и отправка запроса
+/// происходили в рамках одного соединения/канала. Объединение в одну структуру
+/// гарантирует, что канал не закроется раньше, чем придёт ответ.
+///
+/// Подробнее о механизме: <https://www.rabbitmq.com/docs/direct-reply-to>
 pub struct DirectReply {
     consumer: RabbitConsumer,
     publisher: RabbitPublisher,
@@ -177,6 +193,9 @@ impl DirectReply {
     {
         self.publisher.publish_with_expiration(dto, timeout).await?;
         let result = self.consumer.consume_with_timeout(timeout).await;
+        // `WaitingTooLong` — общая ошибка таймаута консьюмера; здесь она уточняется до
+        // `WaitingTooLongForReply`, чтобы вызывающий код видел, что именно сервис не ответил,
+        // а не просто кончился общий таймаут ожидания.
         if let Err(BrokerError::WaitingTooLong) = &result {
             #[cfg(feature = "traces")]
             error!(
@@ -219,6 +238,9 @@ impl RabbitAdapter {
     ) -> Result<DirectReply> {
         let channel = self.open_channel(None).await?;
 
+        // `reply_to` указывает получателю, куда отправить ответ.
+        // Псевдо-очередь `amq.rabbitmq.reply-to` — специальное имя, зарезервированное RabbitMQ;
+        // декларировать её не нужно и нельзя.
         let basic_props =
             basic_props.with_reply_to("amq.rabbitmq.reply-to").finish();
         let publisher = self
@@ -231,7 +253,8 @@ impl RabbitAdapter {
 
         let consume_args =
             BasicConsumeArguments::new("amq.rabbitmq.reply-to", consumer_tag)
-                // Важный аспект Direct Reply-To механизма
+                // `auto_ack(true)` обязателен для `amq.rabbitmq.reply-to`:
+                // RabbitMQ не поддерживает manual-ack на этой псевдо-очереди.
                 .auto_ack(true)
                 .finish();
         let consumer = self
@@ -261,6 +284,8 @@ impl RabbitAdapter {
         channel: Channel,
     ) -> Result<RabbitConsumer> {
         let op = || channel.basic_consume_rx(consume_args.clone());
+        // `basic_consume_rx` возвращает `(consumer_tag, UnboundedReceiver)`.
+        // Consumer tag не нужен снаружи — он уже зафиксирован в `consume_args`.
         let (_, rx) = op.retry(&self.retry_args).await.map_err(|err| {
             #[cfg(feature = "traces")]
             error!(
@@ -272,6 +297,8 @@ impl RabbitAdapter {
             err
         })?;
 
+        // `no_ack` в AMQP означает "не требовать подтверждения".
+        // Инвертируем: если брокер не требует ack, то manual_ack = false.
         let manual_ack = !consume_args.no_ack;
         let rabbit_channel =
             RabbitChannel::new(channel, self.retry_args.clone(), Vec::new());

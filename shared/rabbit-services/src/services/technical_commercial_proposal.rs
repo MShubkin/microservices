@@ -1,3 +1,4 @@
+//! Клиент RabbitMQ для сервиса TCP (технико-коммерческое предложение).
 use std::{sync::Arc, time::Duration};
 
 use broker::rabbit::RabbitAdapter;

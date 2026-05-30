@@ -8,19 +8,17 @@ use crate::{
     services::{log_storage::LogStorageService, AsezRabbitService},
 };
 
-/// # Описание
+/// Коллбэк, который при каждой публикации отправляет запись в сервис `log-storage`.
 ///
-/// Используется для отправки лога в сервис `log-storage`
-/// при отправке сообщения паблишером
+/// Регистрируется через `AsezRabbitService::with_log_callback()`.
 ///
-/// # Важно
+/// Для корректной записи лога в [`BasicProperties`] публикуемого сообщения должны быть заполнены:
+/// - `user_id` (заголовок [`REQUEST_USER_ID_HEADER`]) -- кто инициировал действие;
+/// - `message_id` (заголовок [`REQUEST_ID_HEADER`]) -- UUID запроса для сквозной трассировки.
 ///
-/// Перед отправкой в [`amqprs::BasicProperties`] обязательно надо
-/// указать `user_id` и `message_id`. Если сообщение только только пришло
-/// по хттп от фронта, то `message_id` генерируется вручную. Если же
-/// к сервису пришел запрос от другого сервиса по amqp, то он должен взять
-/// этот `message_id` из запроса сервиса и вставить его в [`amqprs::BasicProperties`],
-/// если предполагается, что он будет делать запрос в другой сервис
+/// Если запрос пришёл по HTTP, `message_id` генерируется middleware.
+/// Если запрос пришёл по AMQP от другого сервиса, надо скопировать `message_id`
+/// из входящего сообщения, иначе цепочка логов прервётся.
 #[derive(Clone, Debug)]
 pub struct LogStorageCallback {
     service_caller: Source,
@@ -34,6 +32,11 @@ impl LogStorageCallback {
 
 #[async_trait]
 impl RabbitChannelCallback for LogStorageCallback {
+    /// Вызывается брокер-адаптером сразу после публикации каждого сообщения.
+    ///
+    /// Читает `user_id` и `request_id` из заголовков опубликованного сообщения
+    /// и формирует запись в `log-storage`. Если заголовки отсутствуют --
+    /// запись всё равно отправляется, но с пустыми полями идентификации.
     async fn on_publish(
         &self,
         channel: &broker::rabbit::RabbitChannel,

@@ -6,16 +6,10 @@ use broker::{
 
 use env_setup::RabbitCfg;
 
-/// # Описание
+/// Создаёт подключение к RabbitMQ с повторными попытками.
 ///
-/// Создание [адаптера RabbitMQ](RabbitAdapter)
-///
-/// # Аргументы
-/// * `config` - [Конфиг](RabbitCfg) для создания [адаптера](RabbitAdapter) RabbitMQ
-///
-/// # Возвращает
-/// * Ok([`RabbitAdapter`]) - Успешное создание [адаптера](RabbitAdapter) RabbitMQ
-/// * Err([`BrokerError`]) - Ошибка при создании соединения с RabbitMQ сервером
+/// `RetryArgs::default()` берёт `retries`/`retry_interval_ms` из конфига.
+/// Это нужно при старте в Docker Compose, где RabbitMQ поднимается позже сервиса.
 pub async fn setup_rabbit_adapter(
     config: &RabbitCfg,
 ) -> BrokerResult<RabbitAdapter> {

@@ -66,6 +66,15 @@ impl AsezRabbitService for MasterDataService {
     }
 }
 
+/// Сокращение для однотипных методов `MasterDataService`.
+///
+/// Форма `service_call!(name(Req) -> Res;)` -- отправляет запрос в очередь
+/// `RequestDictionaries` (получение справочников).
+///
+/// Форма `service_call!(name(Req as Variant) -> Res;)` -- оборачивает запрос в
+/// вариант `MasterDataAction::Variant` и отправляет в очередь `MasterDataAction`.
+/// Это нужно, потому что сервис НСИ принимает все действия в одну очередь,
+/// различая их по варианту enum'а в теле.
 macro_rules! service_call {
     ($(#[$meta:meta])* $name:ident($req:ty) -> $res:ty;) => {
         $(#[$meta])*
@@ -87,6 +96,7 @@ macro_rules! service_call {
         pub async fn $name(&self, dto: $req) -> AsezResult<$res> {
             let response = self
                 .service_request(
+                    // Оборачиваем запрос в нужный вариант дискриминированного union'а.
                     $selector(dto),
                     self.rabbit_properties.clone(),
                     AsezRabbitRouting::MasterDataAction,

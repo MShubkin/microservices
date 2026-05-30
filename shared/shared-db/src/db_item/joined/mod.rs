@@ -1,12 +1,14 @@
-//! The `joined` module is responsible for making selects where join is enacted.
+//! Построитель JOIN-запросов к нескольким таблицам.
 //!
-//! This is needed to effectively select items from multiple tables without
-//! resorting to a lot of boiler plate. This approach is of limited flexibility
-//! but should suffice for our initial needs. In more exotic cases we can use
-//! raw sql.
+//! Позволяет декларативно описать соединение нескольких [`DbItem`]-таблиц
+//! без написания сырого SQL. Три вида соединений:
+//! - [`NormalJoin`] -- INNER JOIN
+//! - [`LeftJoin`] -- LEFT JOIN (дополнительная таблица может отсутствовать)
+//! - [`AggrJoin`] -- LEFT JOIN с агрегацией через `array_agg()`
 //!
-//! For a start we use one table as a main table and left join other tables onto
-//! other tables that refer to it, or that it refers to.
+//! Для каждой пары таблиц нужно реализовать [`JoinTo`] (обычно через [`impl_join_on!`]).
+//! Конечный результат строится макросом [`joined!`], который генерирует
+//! структуру результата и селектор с типизированным API.
 use super::selection::{FieldSortKind, FieldSortOrder, NullPosition, SelectMaker};
 use super::Select;
 use crate::result::{Result, SharedDbError};
@@ -19,18 +21,20 @@ use std::marker::PhantomData;
 #[cfg(test)]
 mod tests;
 
+/// Маркер для агрегирующего JOIN (результаты оборачиваются в `array_agg`).
 #[derive(Debug, Default, Clone, Copy)]
-/// represents the creation of an aggregate join.
 pub struct AggrJoin;
 
+/// Маркер для LEFT JOIN (в результате может быть `Option<T>`).
 #[derive(Debug, Default, Clone, Copy)]
-/// Represents the creation of a left join
 pub struct LeftJoin;
 
+/// Маркер для обычного INNER JOIN.
 #[derive(Debug, Default, Clone, Copy)]
-/// Represents the creation of a normal inner join.
 pub struct NormalJoin;
 
+/// Типаж-маркер для вида соединения. Константы `LEFT` и `AGG` управляют
+/// генерацией SQL в `JoinedSelect::join`.
 pub trait JoinKind: Default {
     const LEFT: bool = false;
     const AGG: bool = false;
@@ -47,31 +51,32 @@ impl JoinKind for AggrJoin {
 }
 
 #[async_trait::async_trait]
-/// The trait bound is for the OTHER table you are joining to.
-/// NB: The extra trait bound here allows us to implement `JoinTo` multiple
-/// times for a single type, easch time using different tables.
-/// eg, `impl JoinTo<Agenda> for AgendaItem {}`,
-///     `impl JoinTo<RelAgendaProtocolItem> for AgendaItem {}`.
+/// Трейт соединения: описывает, как таблица `Self` присоединяется к `ForeignTable`.
+///
+/// Дополнительный параметр `Join: JoinKind` позволяет реализовать `JoinTo`
+/// несколько раз для одной пары таблиц с разными видами соединения.
+/// Например:
+/// ```ignore
+/// impl JoinTo<Agenda, AggrJoin> for AgendaItem {}
+/// impl JoinTo<RelAgendaProtocolItem, LeftJoin> for AgendaItem {}
+/// ```
 pub trait JoinTo<ForeignTable: DbItem, Join: JoinKind>: DbItem {
-    /// This gives us the default foreign key. There is no compile time check for
-    /// correctness here, although there are run time checks.
+    /// Поле `ForeignTable`, по которому происходит соединение по умолчанию.
     const DEFAULT_FKEY: &'static str;
+    /// Поле `Self`, которое ссылается на `ForeignTable` по умолчанию.
     const DEFAULT_PKEY: &'static str;
 
-    /// Essentially all this does is to carry out a series of checks as to
-    /// whether the two tables can be joined and that all criteria are fulfilled.
+    /// Проверяет, что `select`, `own_key` и `foreign_table_key` корректны
+    /// для данного JOIN -- поля присутствуют в соответствующих таблицах
+    /// и включены в `field_list` select'а.
     ///
-    /// TODO: Decide whether we need this check at all. Reason: Whether the check fails or not
-    /// we will still fail at runtime if the join is "bad". However if we do not have a check
-    /// we fail across the DB-boundary.
+    /// Без этой проверки мы всё равно упадём при выполнении запроса --
+    /// но уже за границей БД, с менее понятным сообщением об ошибке.
     fn check_joinable_select(
         select: &Select,
         own_key: &str,
         foreign_table_key: &str,
     ) -> Result<()> {
-        // We perform a series of sanity checks before making a select statement
-        // otherwise we risk ending up with a joined select that makes no sense,
-        // eg, having a selection of fields that does not include its own key.
         if !Self::FIELDS.iter().any(|x| *x == own_key) {
             return Err(SharedDbError::Join(format!(
                 "field '{}' used for join but not found in table '{}'",
@@ -98,19 +103,17 @@ pub trait JoinTo<ForeignTable: DbItem, Join: JoinKind>: DbItem {
         Ok(())
     }
 
-    /// Creates a default joined select. By default:
-    /// - The whole table is selected with no filters.
-    /// - The join will join this type's default foreign key
-    ///   onto the specified key. This can be changed with
+    /// Создаёт данные JOIN по указанному ключу `ForeignTable`.
     ///
-    /// `own_key` can be changed using `JoinSelectData::eq_own` and a select
-    /// can be changed using `JoinSelectData::selecting`.
+    /// Используется когда нужно переопределить ключ соединения (не `DEFAULT_PKEY`).
+    /// `own_key` (ключ `Self`) берётся из `DEFAULT_FKEY`.
     fn join_on(f: &str) -> JoinedSelectData<Self, ForeignTable, Join> {
         let mut j = Self::join_default();
         j.foreign_table_key = f.to_string();
         j
     }
 
+    /// Создаёт данные JOIN с ключами по умолчанию.
     fn join_default() -> JoinedSelectData<Self, ForeignTable, Join> {
         JoinedSelectData {
             foreign_table_key: Self::DEFAULT_PKEY.to_string(),
@@ -133,15 +136,16 @@ where
     O: DbItem,
     K: JoinKind,
 {
-    /// Determines what foreign key the table is being joined onto.
+    /// Переопределяет ключ `Self`, по которому происходит соединение.
     pub fn eq_own(mut self, own_field: &str) -> Self {
         self.own_key = own_field.to_string();
         self
     }
 
-    /// Finalise the JoinDataBuilder. It should be noted, that the field selection is
-    /// never inherited here and all fields specified by default are always inherited.
-    /// Conversely, filters, chunking and ordering are inherited.
+    /// Применяет фильтры, порядок и distinct_on из `select` к этому JOIN.
+    ///
+    /// Список полей не наследуется -- всегда берутся все поля таблицы.
+    /// Это гарантирует, что `FromRow` сможет собрать структуру из результата.
     pub fn selecting(mut self, select: Select) -> JoinedSelectData<T, O, K> {
         self.select.filter_list = select.filter_list;
         self.select.order_list = select.order_list;
@@ -149,17 +153,17 @@ where
         self
     }
 
-    /// Adds distinct clause for that table.
+    /// Добавляет DISTINCT к подзапросу этой таблицы.
     pub fn distinct(mut self) -> Self {
         self.distinct = true;
         self
     }
 
-    /// Добавляет внешний набор сортировок. Это может вызвать проблемы в сочетании с
-    /// предложением outer distinct.
-    /// Ничего не дает, если таблица AGGR джойнится.
+    /// Добавляет сортировку во внешний ORDER BY составного запроса.
     ///
-    /// Возвращает ошибку, если какое поле не принадлежит таблице
+    /// Не влияет на AGGR JOIN (агрегированные таблицы сортируются внутри
+    /// `array_agg` через [`order_aggr_by`]).
+    /// Возвращает ошибку, если поле не принадлежит таблице.
     pub fn add_outer_order(
         &mut self,
         field: &str,
@@ -196,19 +200,18 @@ where
         Ok(self)
     }
 
-    /// Определение порядка NULL значений при сортировке по всем полям во
-    /// внешем ORDER BY
+    /// Устанавливает позицию NULL для всех полей внешнего ORDER BY.
     pub fn with_null_position(mut self, pos: NullPosition) -> Self {
         self.outer_order.iter_mut().for_each(|o| o.null_position = Some(pos));
         self
     }
 
-    /// При сортировке по каждому полю NULL значения будут идти первыми
+    /// NULL значения идут первыми во внешней сортировке.
     pub fn with_nulls_first(self) -> Self {
         self.with_null_position(NullPosition::First)
     }
 
-    /// При сортировке по каждому полю NULL значения будут идти последними
+    /// NULL значения идут последними во внешней сортировке.
     pub fn with_nulls_last(self) -> Self {
         self.with_null_position(NullPosition::Last)
     }
@@ -219,9 +222,9 @@ where
     T: JoinTo<O, AggrJoin>,
     O: DbItem,
 {
-    /// If the joined table is aggregated, it will be internally ordered with
-    /// `agg_array(table ORDER_BY field)`
-    /// This function is only available for aggregate type joins.
+    /// Задаёт внутренний порядок сортировки для `array_agg(table ORDER BY field)`.
+    ///
+    /// Влияет только на агрегирующие JOIN'ы -- для остальных видов не имеет смысла.
     fn order_aggr_by(mut self, field: &str, order: FieldSortKind) -> Result<Self> {
         if !T::FIELDS.iter().any(|x| *x == field) {
             return Err(format!(
@@ -247,17 +250,20 @@ where
         self.order_aggr_by(field, FieldSortKind::Desc)
     }
 
-    /// Adds `DISTINCT` to the `array_agg` to remove duplicates from the array.
+    /// Добавляет `DISTINCT` внутрь `array_agg`, чтобы убрать дубликаты.
     ///
-    /// NB. It seems that this requires inner select to have `ORDER BY` clause,
-    /// and it does not work with `[Self::order_aggr_by()]`.
+    /// NB: требует наличия ORDER BY в подзапросе; не совместим с `order_aggr_by`.
     pub fn distinct_aggr(mut self, value: bool) -> Self {
         self.distinct_aggr = value;
         self
     }
 }
 
-/// This exists to store all the instructions to make a joined select.
+/// Хранит все параметры для построения одного JOIN.
+///
+/// Создаётся через `JoinTo::join_on` или `JoinTo::join_default` и
+/// при необходимости настраивается через методы `eq_own`, `selecting` и т.д.
+/// Передаётся в `JoinedSelect::join`.
 #[derive(Debug, Clone)]
 pub struct JoinedSelectData<T, O, K>
 where
@@ -277,20 +283,19 @@ where
     kind: PhantomData<K>,
 }
 
-/// A history fragment records a semi-completed fragment of the joined select.
-/// it needs to store the query string in order to have the parts of the query
-/// that relate to the table. (since it cannot store type information including
-/// constants such as T::TABLE or T::FIELDS.
-/// In addition it must store the actual select as the variables which are bound
-/// to each individual select are stored there.
+/// Промежуточный фрагмент истории построения JOIN.
+///
+/// Хранит уже построенный подзапрос таблицы: строку SQL и соответствующий `Select`
+/// с переменными для привязки. Стирает типовую информацию (`T::TABLE`, `T::FIELDS`),
+/// чтобы фрагменты можно было хранить в однородном `Vec`.
 struct HistoryFragment {
-    // The select must be stored as it holds the vars to bind to the query.
+    // Select хранится, потому что содержит переменные для привязки к запросу.
     select: Select,
-    /// The table must be stored as it is used when finalising the joined query.
+    /// Имя таблицы нужно при финализации составного запроса.
     table: &'static str,
-    /// Aggregate queries are treated with group by.
+    /// Агрегирующие таблицы требуют GROUP BY.
     is_aggregate: bool,
-    /// Query string is extracted from the select maker.
+    /// SQL-фрагмент, сгенерированный SelectMaker.
     query_string: String,
     distinct_table: bool,
     ordered_aggr: Vec<FieldSortOrder>,
@@ -298,21 +303,27 @@ struct HistoryFragment {
     outer_order: Vec<FieldSortOrder>,
 }
 
+/// Построитель составного JOIN-запроса.
+///
+/// Заполняется последовательными вызовами `initiate` + `join`, после чего
+/// финализируется через `construct_query` и выполняется через `FinalJoinedSelect::get`.
 pub struct JoinedSelect {
-    /// Table name and whether it is aggregate or not.
+    /// Фрагменты по каждой таблице в порядке добавления.
     tables: Vec<HistoryFragment>,
-    /// The total number of binds thus far.
+    /// Суммарный счётчик привязок для корректной нумерации `$N`.
     binds: usize,
 }
 
 impl JoinedSelect {
+    /// Инициализирует JOIN по главной таблице `T`.
+    ///
+    /// Список полей принудительно заменяется полным набором (`Select::full<T>`),
+    /// чтобы `FromRow` мог восстановить структуру из результата.
     pub async fn initiate<T: DbItem>(
         mut select: Select,
         distinct: bool,
         outer_order: Vec<FieldSortOrder>,
     ) -> Result<JoinedSelect> {
-        // Data internally tests our select for consistency: Most importantly it
-        // disallows abuse of fields (currently our joins need all fields of a structure)
         select.field_list = Select::full::<T>().field_list;
         let maker = SelectMaker::<T>::start(&select).await?.stack().await?;
 
@@ -334,6 +345,11 @@ impl JoinedSelect {
         })
     }
 
+    /// Добавляет следующую таблицу к JOIN.
+    ///
+    /// Тип JOIN (INNER/LEFT/AGG) определяется параметром `K`. Нумерация
+    /// placeholder'ов продолжается с того места, где остановилась предыдущая
+    /// таблица (`self.binds`).
     pub async fn join<T, O, K>(
         mut self,
         select_box: JoinedSelectData<T, O, K>,
@@ -343,9 +359,6 @@ impl JoinedSelect {
         O: DbItem,
         K: JoinKind,
     {
-        // The select is checked at this level rather than the level of `JoinedSelectData`
-        // as the default selection box from `join_on` may in fact not be entirely
-        // correct.
         T::check_joinable_select(
             &select_box.select,
             &select_box.own_key,
@@ -387,6 +400,8 @@ impl JoinedSelect {
         Ok(self)
     }
 
+    /// Строит SELECT-часть: для обычных таблиц -- `table`, для агрегирующих --
+    /// `array_agg(table ORDER BY ...) as table`.
     fn construct_fields(&self) -> String {
         self.tables
             .iter()
@@ -414,8 +429,8 @@ impl JoinedSelect {
             .join(",")
     }
 
+    /// Строит GROUP BY по всем не-агрегирующим таблицам (и полям внешней сортировки).
     fn construct_group_by(&self) -> String {
-        // We must group by all fields that are not aggregate.
         let not_aggr_count = self.tables.iter().filter(|x| !x.is_aggregate).count();
 
         if not_aggr_count != 0 {
@@ -444,6 +459,7 @@ impl JoinedSelect {
         }
     }
 
+    /// Строит DISTINCT ON по таблицам с флагом `distinct_table == true`.
     fn construct_outer_distincts(&self) -> String {
         let distincts = self
             .tables
@@ -458,6 +474,7 @@ impl JoinedSelect {
         }
     }
 
+    /// Строит внешний ORDER BY из полей `outer_order` каждой таблицы.
     fn construct_outer_order(&self) -> String {
         let orders = self
             .tables
@@ -465,7 +482,6 @@ impl JoinedSelect {
             .flat_map(|x| {
                 x.outer_order
                     .iter()
-                    // Notation is strange but works see impl Display for FieldSortOrder
                     .map(|f| format!("{t}.{o}", t = x.table, o = f))
                     .collect::<Vec<_>>()
             })
@@ -477,8 +493,8 @@ impl JoinedSelect {
         }
     }
 
-    /// Finalise the joined select, leaving only table names and to bind and
-    /// and the query string.
+    /// Финализирует построитель: собирает итоговую SQL-строку и список `Select`
+    /// для привязки переменных. Результат можно исполнить через `FinalJoinedSelect::get`.
     pub fn construct_query(self) -> FinalJoinedSelect {
         let fields = self.construct_fields();
         let distincts = self.construct_outer_distincts();
@@ -504,8 +520,10 @@ impl JoinedSelect {
     }
 }
 
-/// Represents a final joined select with the sql query and the source
-/// Selects.
+/// Финальный JOIN-запрос, готовый к исполнению.
+///
+/// Используется для инспекции SQL строки перед выполнением, если нужна отладка.
+/// В обычных случаях используйте `Selector::get` напрямую.
 #[derive(Debug)]
 pub struct FinalJoinedSelect {
     query_string: String,
@@ -513,6 +531,7 @@ pub struct FinalJoinedSelect {
 }
 
 impl FinalJoinedSelect {
+    /// Выполняет запрос и десериализует результаты в тип `J`.
     pub async fn get<'a, J, Ex>(self, pool: Ex) -> Result<Vec<J>>
     where
         J: for<'d> sqlx::FromRow<'d, PgRow> + Send + Unpin,
@@ -530,46 +549,52 @@ impl FinalJoinedSelect {
     }
 }
 
+/// Извлекает значение нужного типа из строки результата JOIN.
+///
+/// Три формы:
+/// - `left` -- `Option<T>` (LEFT JOIN, таблица может отсутствовать)
+/// - `aggr` -- `Vec<T>` (AGG JOIN, массив агрегированных строк)
+/// - без суффикса -- `T` (INNER JOIN, таблица всегда присутствует)
 #[macro_export]
-// Convert rows correctly for the three join types
 macro_rules! convert_row {
-    // Left join.
     ($row:expr, $subt:ty, left) => {
         $row.try_get(<$subt>::TABLE).map(|x: Option<$subt>| x)?
     };
-    // Aggregate join
     ($row:expr, $subt:ty, aggr) => {
         $row.try_get_unchecked(<$subt>::TABLE).map(|x: Vec<Option<$subt>>| {
             x.into_iter().filter_map(|x| x).collect::<Vec<_>>()
         })?
     };
-    // Normal join
     ($row:expr, $subt:ty, ) => {
         $row.try_get(<$subt>::TABLE).map(|x: $subt| x)?
     };
 }
 
+/// Определяет Rust-тип поля результата JOIN в зависимости от вида соединения.
+///
+/// Принимает тип таблицы и опциональный суффикс вида соединения:
+/// - `($t, left)` → `Option<$t>` (LEFT JOIN — присоединённой строки может не быть)
+/// - `($t, aggr)` → `Vec<$t>`    (AGG JOIN — массив агрегированных строк)
+/// - `($t,)`      → `$t`         (INNER JOIN)
+///
+/// Сигнатура с двумя аргументами обязательна: call-сайт в `joined!` передаёт
+/// `$crate::join_type!($subt, $($kind)?)`, где `$kind` опционален.
 #[macro_export]
 macro_rules! join_type {
-    // Left join.
     ($tpe:ty, left) => { Option<$tpe> };
-    // Aggregate join
     ($tpe:ty, aggr) => { Vec<$tpe> };
-    // Normal join
-    ($tpe:ty, ) => { $tpe };
+    ($tpe:ty $(,)?) => { $tpe };
 }
 
+/// Возвращает маркерный тип [`JoinKind`] по суффиксу вида соединения.
 #[macro_export]
 macro_rules! join_kind {
-    // Left join.
     (left) => {
         $crate::db_item::joined::LeftJoin
     };
-    // Aggregate join
     (aggr) => {
         $crate::db_item::joined::AggrJoin
     };
-    // Normal join
     () => {
         $crate::db_item::joined::NormalJoin
     };
@@ -577,26 +602,24 @@ macro_rules! join_kind {
 
 #[macro_export]
 macro_rules! make_type {
-    // user name & generated name. -> user name
     (pub type $name:ident = $stream:tt) => {
         #[allow(dead_code)]
         pub type $name = $stream;
     };
-    // Only the generated name. -> generated_name
     (pub type  = $stream:tt) => {};
 }
 
-/// This macro implements the `JoinOn` trait for two DbItems.
-/// It is separate from the `joined` macro, as it implements a trait, and it is possible
-/// that this will be implemented multiple times, which would cause problems.
-/// It should be noted that without `joined`, this is of limited use.
+/// Реализует трейт [`JoinTo`] для пары таблиц.
 ///
-/// *main_type*: The DbItem type of the main table being joined.
-/// *second_tpe*: The DbItem type that it is being joined to.
-/// *sec_default_key*: The key(field) of the `second_tpe` that is normally used.
-/// *main_default_key*: The key(field) of the `main_tpe` that is normally used.
-/// *kind*: The kind of join that is being formed permitted values are 'left' or 'agg. If left empty
-/// an inner join will be formed.
+/// Параметры:
+/// - `$main_tpe` -- тип главной таблицы
+/// - `$main_default_key` -- ключ главной таблицы (по умолчанию)
+/// - `$second_tpe` -- тип присоединяемой таблицы
+/// - `$sec_default_key` -- ключ присоединяемой таблицы (по умолчанию)
+/// - `$kind` -- `left` | `aggr` | пусто (inner)
+///
+/// Вызывается отдельно от `joined!`, так как реализует трейт и может вызываться
+/// несколько раз для одной пары (разные виды JOIN).
 #[macro_export]
 macro_rules! impl_join_on {
     ($main_tpe:ty:$main_default_key:ident => $second_tpe:ty:$sec_default_key:ident $(,$kind:tt)?) => {
@@ -609,48 +632,27 @@ macro_rules! impl_join_on {
     };
 }
 
-/// This provides a more or less safe and sane interface for DbItems (tables) in simple
-/// ways. It generates two structures `Joinedsomething` and `JoinedsomethingSelector`.
-/// `JoinedsomethingSelector` provides an interface for making a selection within each join.
-/// Thus if we are joining `Agenda`, `AgendaItem` (aggregate), AgendaResult (left), we
-/// can generate:
-/// ```ignore
-/// Joinedagenda {
-///     agenda: Agenda,
-///     agenda_items: Vec<AgendaItem>,
-///     agenda_result: Option<AgendaResult>,
-/// }
-/// ```
-/// We also generate the selector, which gives us an interface such that we can
-/// make a selection based on some agenda field, eg. id:
-/// ```ignore
-/// let selection = some_make_select_function();
-/// let joined_agendas = JoinedagendaSelector::new(selection).get(&db_pool).await?;
-/// ```
-/// We can also make a more complex selection, such as.
-/// ```ignore
-/// let selection = some_make_select_function();
-/// let res_selection = some_make_res_select_function();
-/// let result_select: AgendaResult::join_default().selection(res_selection);
+/// Генерирует типизированную структуру результата и селектор для JOIN нескольких таблиц.
 ///
-/// let joined_agendas = JoinedagendaSelector::new(selection)
-///     .set_agenda_result(result_selector)
-///     .get(&pg_pool)
-///     .await?;
-/// ```
-/// The macro also requires `impl_joined_on` to be called for the combination. So in
-/// this example we call:
+/// Создаёт:
+/// - `Joined{Main}{Sub1}{Sub2}` -- структура с полями по одному на каждую таблицу.
+/// - `Joined{Main}{Sub1}{Sub2}Selector` -- построитель запроса с методами
+///   `new(select)`, `set_{sub}(...)` для каждой присоединяемой таблицы,
+///   `get(&pool)` для выполнения запроса.
+///
+/// Пример: объединение `Agenda`, `AgendaItem` (aggr) и `AgendaResult` (left):
 /// ```ignore
-/// impl_join_on!(Agenda:uuid => AgendaItems:agenda_uuid, aggr);
+/// impl_join_on!(Agenda:uuid => AgendaItem:agenda_uuid, aggr);
 /// impl_join_on!(Agenda:uuid => AgendaResult:agenda_uuid, left);
 /// joined!(
 ///     agenda: Agenda,
-///     agenda_items: AgendaItem[Agenda => AgendaItems, aggr],
-///     agenda_result: AgendaItem[Agenda => AgendaResult, left],
+///     agenda_items: AgendaItem[Agenda => AgendaItem, aggr],
+///     agenda_result: AgendaResult[Agenda => AgendaResult, left],
 /// );
+/// // Использование:
+/// let results = JoinedAgendaAgendaItemAgendaResultSelector::new(my_select)
+///     .get(&pool).await?;
 /// ```
-/// (Таблицы и сущности к примеру. Могут не соответствовать действительности.)
-
 #[macro_export]
 macro_rules! joined {
     ($(!$name:ty,)? $main:ident:$tpe:ty $(,$sub:ident:$subt:ty[$type_a:ty => $type_b:ty $(,$kind:tt)?])+ $(,)?) => {
@@ -659,19 +661,14 @@ macro_rules! joined {
         $crate::make_type!(pub type $([<$name Selector>])? = [<Joined $tpe $($subt)+ Selector>]);
 
         #[derive(Debug, Clone, PartialEq)]
-        /// This is an automatically generated structure representing a join
-        /// of several tables in accordance with set rules.
-        /// Each table (or some of its fields) are represented by a single field,
-        /// which can easily be accessed and extracted.
+        /// Автоматически сгенерированная структура -- результат JOIN нескольких таблиц.
         pub struct [<Joined $tpe $($subt)+>] {
             pub $main: $tpe,
             $(pub $sub: $crate::join_type!($subt, $($kind)?),)+
         }
 
-        /// This represents the process of joining together several tables in
-        /// accordance with set rules.
-        /// The fields are set, but the `set_` functions allow selections from
-        /// specific fields to be set.
+        /// Построитель запроса для JOIN. Позволяет задать отдельные селекты
+        /// для каждой из присоединяемых таблиц через методы `set_{sub}`.
         pub struct [<Joined $tpe $($subt)+ Selector>] {
             distinct: bool,
             order: Vec<$crate::db_item::selection::FieldSortOrder>,
@@ -679,7 +676,7 @@ macro_rules! joined {
             $($sub: $crate::db_item::joined::JoinedSelectData<$type_b, $type_a, $crate::join_kind!($($kind)?)>,)+
         }
 
-        /// By default select everything from the table.
+        /// По умолчанию выбирает все поля всех таблиц без фильтров.
         impl Default for [<Joined $tpe $($subt)+ Selector>] {
             fn default() -> Self {
                 use $crate::db_item::joined::JoinTo;
@@ -700,8 +697,8 @@ macro_rules! joined {
                 new
             }
 
-            /// Добавляет все ордеринги из входящего [`Select`]
-            /// во внешние ордеринги джойн-селекта
+            /// Переносит ORDER BY из входящего [`Select`] во внешние ордеринги
+            /// джойн-селекта, очищая список сортировок у основного select'а.
             #[allow(dead_code)]
             pub fn new_with_order(mut select: $crate::db_item::Select) -> Self {
                 let mut new = Self::default();
@@ -760,10 +757,10 @@ macro_rules! joined {
                         .await
                 }
 
-            /// This function is used to construct a `FinalJoinedSelect` that
-            /// can be easily inspected. It can then be executed by calling `get`
-            /// on the resulting `FinalJoinedSelect`.
-            /// When no inspection is needed, use `get` directly.
+            /// Финализирует построитель без выполнения запроса.
+            ///
+            /// Полезно для отладки или когда нужен объект `FinalJoinedSelect`
+            /// для дальнейшей обработки перед вызовом `get`.
             pub async fn finalise(self) -> $crate::result::Result<$crate::db_item::joined::FinalJoinedSelect> {
                 let r = $crate::db_item::joined::JoinedSelect::initiate::<$tpe>(
                     self.$main,

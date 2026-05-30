@@ -1,3 +1,4 @@
+//! Клиент RabbitMQ для сервиса Views (сессии, права, уведомления).
 use shared_essential::domain::view_storage::notification::NotificationType;
 use std::{sync::Arc, time::Duration};
 use uuid::Uuid;

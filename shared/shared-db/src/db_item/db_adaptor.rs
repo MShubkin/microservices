@@ -8,7 +8,11 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Executor, Postgres};
 use std::fmt::Debug;
 
-/// This exists for unambiguous serialization of DbAdaptor.
+/// Вспомогательный тип для однозначной сериализации опциональных полей адаптора.
+///
+/// Serde не умеет отличить `None` (поле отсутствует в JSON) от `null` без
+/// дополнительных атрибутов. `DbAdaptorOption` используется с `#[serde(with = ...)]`,
+/// чтобы поле сериализовалось без обёртки `{"Some": ...}`.
 #[derive(Serialize, Deserialize)]
 #[serde(remote = "Option")]
 #[serde(untagged)]
@@ -23,20 +27,34 @@ impl<T> Default for DbAdaptorOption<T> {
     }
 }
 
-/// This trait exists as a defined adaptor so that we can deserialize `DbItem` from Data Transfer Objects.
-/// In other words, all D.T.Os that we use as stand-ins for database objects must implement this.
+/// Трейт DTO-адаптора для [`DbItem`].
+///
+/// Каждое поле адаптора имеет тип `Option<T>`, что позволяет фронтенду
+/// передавать только изменяемые поля. `None` означает "не трогать поле",
+/// `Some(v)` -- обновить до `v`.
+///
+/// Реализуется через `#[derive(DbAdaptor)]`, которая по исходной структуре
+/// `DbItem` генерирует теневую структуру `{Name}Rep` с `Option`-полями,
+/// методы конвертации и вычисления масок.
 #[async_trait::async_trait]
 pub trait DbAdaptor:
     Debug + Sync + Send + for<'a> Deserialize<'a> + Serialize
 {
     type DbItem: DbItem;
+    /// Поля-дубликаты адаптора, которые не соответствуют колонкам БД.
+    /// Нужны для дополнительных данных, которые дублируют существующие поля
+    /// под другим именем (например, альтернативное имя для фронтенда).
     const DUP_FIELDS: &'static [&'static str];
 
+    /// Конвертирует адаптор в [`DbItem`], разворачивая `Option`-поля.
+    ///
+    /// Если поле имеет `None`, оно заменяется дефолтным значением.
     fn into_item(self) -> Result<Self::DbItem>;
 
-    /// An optional list of fields to send is supplied. This allows us to deactivate
-    /// certain fields before conversion and send only the remaining fields.
-    /// NB: We do not apply tolerance internally here.
+    /// Конвертирует [`DbItem`] в адаптор.
+    ///
+    /// Если `fields` не `None`, только перечисленные поля попадают в `Some(...)`,
+    /// остальные остаются `None`. Первичные ключи включаются всегда.
     fn from_item<T>(item: Self::DbItem, fields: Option<&[T]>) -> Self
     where
         T: AsRef<str>,
@@ -48,29 +66,31 @@ pub trait DbAdaptor:
         Self::from_item_masked(item, &mask)
     }
 
-    /// Returns adapter with full set of fields.
+    /// Конвертирует [`DbItem`] в адаптор с полным набором полей.
     fn from_item_full(item: Self::DbItem) -> Self {
         let mask = DbAdaptorFieldMask::all();
         Self::from_item_masked(item, &mask)
     }
 
+    /// Конвертирует [`DbItem`] в адаптор по заданной маске.
+    ///
+    /// Поля с `mask=false` выставляются в `None`, остальные в `Some(...)`.
     fn from_item_masked(
         item: Self::DbItem,
         mask: &DbAdaptorFieldMask<Self>,
     ) -> Self;
 
-    /// Returns mask of fields set to `Some()` in this adaptor.
+    /// Возвращает маску полей, у которых в этом адапторе стоит `Some(...)`.
     ///
-    /// This is not perfect, but still allows us to reduce the number of fields we
-    /// update. This bind mask should be used with care as it can lead to values
-    /// never being updated back to default.
+    /// Позволяет при массовом обновлении обновлять только переданные поля,
+    /// а не все поля таблицы. Осторожно: если поле было `None` изначально,
+    /// оно останется без изменений -- нет способа сбросить поле в дефолт
+    /// через такую маску.
     fn bind_mask(&self) -> DbFieldMask<Self::DbItem>;
 
-    /// Returns mask of fields set to `Some()` in any of the adaptors `items`.
+    /// Строит маску как объединение (`OR`) масок всех переданных адапторов.
     ///
-    /// This is not perfect, but still allows us to reduce the number of fields we
-    /// update. This bind mask should be used with care as it can lead to values
-    /// never being updated back to default.
+    /// Поле входит в маску, если хотя бы в одном адапторе оно `Some(...)`.
     fn create_default_bind_mask<'a, I>(items: I) -> DbFieldMask<Self::DbItem>
     where
         I: IntoIterator<Item = &'a Self>,
@@ -79,33 +99,32 @@ pub trait DbAdaptor:
         items.into_iter().fold(DbFieldMask::none(), |m, i| m | i.bind_mask())
     }
 
-    /// This is a stricter version of `create_default_bind_mask` which needs all items
-    /// to have `Some` in the field before for it to be marked as `true`. If items
-    /// have mixed Some/None values for a field, an error is returned.
+    /// Строгий вариант: поле входит в маску только если оно `Some(...)` у всех адапторов.
+    ///
+    /// Если у разных адапторов поле частично `Some`/`None` -- возвращает ошибку.
     fn create_strict_bind_mask(items: &[Self])
         -> Result<DbFieldMask<Self::DbItem>>;
 
-    /// Merges `item` with exising (non-`None``) values from this adaptor.
+    /// Мёрджит адаптор с существующим [`DbItem`]: поля `Some(...)` заменяют
+    /// значения в `item`, поля `None` оставляют значения как есть.
     ///
-    /// This is useful when some business logic needs some fields received from a DTO and others from DB.
+    /// Полезно когда часть полей приходит из DTO, а часть нужно взять из БД.
     fn into_item_merged(self, item: Self::DbItem) -> Result<Self::DbItem>;
 
-    /// This function sets the listed fields to `Some(Default::default())`.
+    /// Выставляет указанные поля в `Some(Default::default())`.
     ///
-    /// Even if the field is set as `None` initially, it will subsequently be set to `Some(Default::default())`
+    /// Позволяет явно обнулить поля до значения по умолчанию, даже если
+    /// они были `None`.
     fn zero_fields(self, field_mask: &DbFieldMask<Self::DbItem>) -> Self;
 
-    /// This function sets the listed fields to `None`.
+    /// Выставляет указанные поля в `None`.
     fn unset_fields(self, field_mask: &DbFieldMask<Self::DbItem>) -> Self;
 
-    /// Merges `item` with exising (non-`None``) values from this adaptor selected by the `mask`.
+    /// Мёрджит с [`DbItem`], но учитывает только поля из `mask`.
     ///
-    /// Note that the `mask` parameter should be obtained by the
-    /// [`make_bind_mask`](asez2_shared_db::db_item::make_bind_mask) function.
-    ///
-    /// This is useful when some business logic needs some fields received from
-    /// a DTO and others from DB, and DTO can contain some fields that are not
-    /// relevant.
+    /// Поля вне маски сбрасываются в `None` перед слиянием, т.е. не
+    /// перезаписывают значения в `item`. Маска должна быть получена через
+    /// [`make_bind_mask`](asez2_shared_db::db_item::make_bind_mask).
     fn into_item_merged_selected(
         self,
         item: Self::DbItem,
@@ -114,10 +133,10 @@ pub trait DbAdaptor:
         self.unset_fields(&mask.inverted()).into_item_merged(item)
     }
 
-    /// This selects items from the table based on criteria and using the `Select` structure. Simple filtration
-    /// operations as well as ordering and selection of specific fields is also possible.
-    /// Trying to specify fields in the wrong order may cause an error to be returned, since the return structure
-    /// is not flexible in the order of fields.
+    /// Выбирает строки из таблицы и конвертирует их в адапторы.
+    ///
+    /// Маска полей адаптора строится из `q.field_list`, поэтому в ответе
+    /// будут `Some(...)` только для запрошенных колонок.
     async fn select<'a, Ex, C>(q: &Select, pool: Ex) -> Result<C>
     where
         Ex: Executor<'a, Database = Postgres>,
@@ -139,7 +158,7 @@ pub trait DbAdaptor:
         }))
     }
 
-    /// Inserts a vec of items into the table returning the inserted rows. (See [`DbItem::insert_vec`])
+    /// Вставляет срез [`DbItem`] и возвращает результат как адапторы (все поля).
     async fn insert_vec_returning<C: FromIterator<Self>>(
         items: &mut [Self::DbItem],
         pool: &mut sqlx::Transaction<Postgres>,
@@ -148,11 +167,10 @@ pub trait DbAdaptor:
         Ok(items.into_iter().adaptors().collect())
     }
 
-    /// This works as `update_vec`, however, it additionally takes a list of fields
-    /// to return. And returns updated objects.
+    /// Обновляет срез [`DbItem`] и возвращает результат как адапторы.
     ///
-    /// NB: If the item does NOT have the `#[sqlx(default)]` attribute then
-    /// `return_fields` must always be set to `None`.
+    /// Если `return_fields` равен `None`, структура должна иметь `#[sqlx(default)]`
+    /// на всех полях -- иначе `FromRow` упадёт.
     async fn update_vec_returning<C: FromIterator<Self>>(
         items: &[Self::DbItem],
         update_fields: Option<&[&str]>,
@@ -174,9 +192,10 @@ pub trait DbAdaptor:
     }
 }
 
-/// Returns a function that converts an item into corresponding adaptor.
+/// Фабрика конвертера `DbItem -> DbAdaptor` для заданного списка полей.
 ///
-/// Useful when mass conversion is needed for data that is not an item iterator.
+/// Удобно при массовой конвертации данных за пределами итераторов над [`DbItem`]:
+/// создаётся один раз, маска вычисляется один раз.
 pub fn from_item_with_fields<'a, T, I, S>(fields: I) -> impl Fn(T::DbItem) -> T
 where
     T: DbAdaptor,
@@ -187,14 +206,16 @@ where
     move |item| T::from_item_masked(item, &mask)
 }
 
-/// This trait is designed to get all the fields of the DbAdaptor entity along with their values
-/// In particular, it is used for export functions
+/// Трейт для получения всех полей адаптора вместе с их значениями.
+///
+/// Применяется при экспорте данных, когда нужно перебрать пары
+/// `(имя_поля, значение)` без знания конкретного типа адаптора.
 pub trait DbAdaptorFieldsWithValues: DbAdaptor {
     const FIELDS: &'static [&'static str];
-    /// Get all fields with values
+    /// Возвращает все поля со значениями.
     fn fields_with_values(&self) -> Vec<Field>;
 
-    /// Returns mapping from field name to index.
+    /// Возвращает отображение `имя_поля -> индекс` для быстрого поиска.
     fn field_index_map<I>() -> I
     where
         I: FromIterator<(&'static str, usize)>,
@@ -207,10 +228,9 @@ pub trait DbAdaptorFieldsWithValues: DbAdaptor {
     }
 }
 
-/// Trait extending `Iterator` of db items with operations that convert elements
-/// to corresponding adaptors.
+/// Расширение для итераторов над [`DbItem`] -- конвертация в адапторы.
 pub trait AdaptorableIter {
-    /// Convert each item into adaptor with all fields.
+    /// Конвертирует каждый элемент в адаптор с полным набором полей.
     fn adaptors<A>(self) -> AdaptorIter<Self, A>
     where
         A: DbAdaptor,
@@ -222,7 +242,8 @@ pub trait AdaptorableIter {
         }
     }
 
-    /// Convert each item into adaptor with specified fields (private key fields are always included).
+    /// Конвертирует каждый элемент в адаптор с указанными полями.
+    /// Первичные ключи всегда включаются в маску.
     fn adaptors_with_fields<'a, A, I, S>(self, fields: I) -> AdaptorIter<Self, A>
     where
         A: DbAdaptor,
@@ -236,7 +257,7 @@ pub trait AdaptorableIter {
         }
     }
 
-    /// Convert each item into adaptor using specified field mask.
+    /// Конвертирует каждый элемент в адаптор по заданной маске.
     fn adaptors_with_mask<A>(
         self,
         mask: DbAdaptorFieldMask<A>,
@@ -251,7 +272,9 @@ pub trait AdaptorableIter {
 
 impl<I> AdaptorableIter for I {}
 
-/// Iterator converting db items into their adaptors.
+/// Итератор, конвертирующий [`DbItem`] в соответствующие адапторы.
+///
+/// Маска вычисляется один раз при создании итератора, а не для каждого элемента.
 pub struct AdaptorIter<I, A>
 where
     A: DbAdaptor,

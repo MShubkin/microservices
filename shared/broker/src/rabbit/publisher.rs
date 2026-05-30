@@ -10,13 +10,18 @@ use crate::Publisher;
 use super::channel::RabbitChannelCallback;
 use super::RabbitChannel;
 
-/// Базовый долгоживущий паблишер rabbit
+/// Долгоживущий паблишер RabbitMQ.
+///
+/// `basic_props` и `publish_args` задаются один раз при регистрации и переиспользуются
+/// при каждом вызове `publish`. Это позволяет не передавать routing-key и exchange
+/// при каждой публикации — они зафиксированы в паблишере. Исключение: `publish_with_expiration`
+/// временно клонирует `basic_props` и добавляет TTL, не затрагивая сохранённые свойства.
 pub struct RabbitPublisher {
-    /// Канал для общения с RabbitMQ сервером
+    /// AMQP-канал для отправки сообщений.
     channel: RabbitChannel,
-    /// Основные свойства
+    /// Свойства по умолчанию для всех сообщений этого паблишера.
     basic_props: BasicProperties,
-    /// Аргументы публикации
+    /// Параметры маршрутизации: exchange и routing key.
     publish_args: BasicPublishArguments,
 }
 
@@ -75,8 +80,11 @@ where
 }
 
 impl RabbitPublisher {
-    /// Для DirectReply лучше чтобы был срок действия сообщения,
-    /// так как он сам даёт timeout.
+    /// Публикует сообщение с TTL, равным таймауту RPC-запроса.
+    ///
+    /// Если сервер не успел обработать запрос до истечения таймаута,
+    /// брокер сам удалит сообщение из очереди — это предотвращает
+    /// накопление устаревших запросов при перегрузке сервиса.
     pub async fn publish_with_expiration<C>(
         &self,
         content: &C,
@@ -85,7 +93,7 @@ impl RabbitPublisher {
     where
         C: Serialize + Send + Sync,
     {
-        // Изменился подход: Сообщение НЕ должно жить дольше чем таймаут.
+        // AMQP ожидает TTL в виде строки с числом миллисекунд.
         let expiration = (expiration.as_millis()).to_string();
 
         let msg_props =

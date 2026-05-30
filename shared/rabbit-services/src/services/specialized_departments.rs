@@ -1,3 +1,4 @@
+//! Клиент RabbitMQ для модуля Специализированных отделов.
 use std::{sync::Arc, time::Duration};
 
 use broker::rabbit::RabbitAdapter;

@@ -11,11 +11,12 @@ use tracing::{debug_span, Instrument, Span};
 
 use super::{ConsumerServer, Result};
 
-/// Хэндлер для базового консьюмера очереди RabbitMQ.
+/// Обработчик входящих сообщений для [`BasicRabbitConsumer`].
 ///
-/// Основная задача -- обработать принятые данные или ошибку принятия данных
-/// (например, ошибку десериализации). Свойства `rabbit_props` могут быть пустыми,
-/// если  консьюмеру не удалось получить сообщение `RabbitMessage` .
+/// Получает результат десериализации (`Ok(T)` или ошибку) и свойства сообщения.
+/// Свойства присутствуют всегда -- они берутся из транспортного сообщения до десериализации.
+/// Реализации могут использовать `rabbit_props` для чтения заголовков трассировки,
+/// `correlation_id` или `reply_to`.
 pub trait BasicConsumerHandler<T> {
     fn handle(
         &self,
@@ -24,18 +25,17 @@ pub trait BasicConsumerHandler<T> {
     ) -> BoxFuture<'static, Result<()>>;
 }
 
-/// Консьюмер сообщений из заданной очереди RabbitMQ.
+/// Базовый консьюмер: подписывается на очередь и в цикле вызывает [`BasicConsumerHandler`].
 ///
-/// Осуществляет следующие действия
-/// - [x] Слушает заданную очередь
-/// - [x] Вызывает обработчик данных
-/// - [x] Трассирует ошибки
+/// Каждое сообщение обрабатывается в отдельной задаче `tokio::spawn`, поэтому
+/// медленный обработчик не блокирует получение следующих сообщений.
+/// При ошибке получения (транспортной) сообщение пропускается с логом и цикл продолжается.
 pub struct BasicRabbitConsumer<H, T> {
-    /// Адептер кролика.
+    /// Адаптер подключения к брокеру.
     adapter: Arc<RabbitAdapter>,
     /// Имя очереди, которую слушает консьюмер.
     queue: String,
-    /// Идентификатор консьюмера.
+    /// Уникальный тег консьюмера (используется для идентификации в логах и при отмене).
     consumer_tag: String,
     /// Обработчик входящих данных.
     handler: H,
@@ -64,6 +64,7 @@ where
     H: BasicConsumerHandler<T> + Send + Sync + 'static,
     T: for<'de> Deserialize<'de> + Debug + Send + Sync + 'static,
 {
+    /// Регистрирует консьюмера и возвращает [`ConsumerServer`] -- future, который надо заспаунить.
     pub async fn run(self) -> Result<ConsumerServer> {
         let consumer = self.register_consumer().await?;
         let fut = Box::pin(self.runner(consumer));
@@ -88,13 +89,16 @@ where
     #[tracing::instrument(level = "debug", name = "rabbit_consumer", skip(self), fields(queue = %self.queue, consumer = %self.consumer_tag))]
     async fn runner(self, mut consumer: RabbitConsumer) -> Result<()> {
         let BasicRabbitConsumer { handler, .. } = self;
+        // Arc нужен, чтобы клонировать ссылку на хэндлер для каждой спаунируемой задачи.
         let handler = Arc::new(handler);
 
         loop {
             let message = match Self::try_consume_message(&mut consumer).await {
                 Ok(v) => v,
                 Err(error) => {
-                    // TODO: remove message from queue?
+                    // Транспортная ошибка: ack/nack отправить нечем (мы не получили
+                    // delivery_tag). Логируем и продолжаем; на стороне `RabbitChannel`
+                    // десериализационные ошибки уже отправляют nack самостоятельно.
                     tracing::error!(%error, "error receiving message from queue, skipping it");
                     continue;
                 }
@@ -102,6 +106,7 @@ where
             let task_span = debug_span!(
                 parent: Span::current(),
                 "message_handler",
+                // correlation_id позволяет связать лог обработки с конкретным запросом.
                 request_id =
                     message.properties.correlation_id().map_or("", String::as_str)
             );
@@ -140,6 +145,8 @@ where
             delivery: _,
             properties,
         } = message;
+        // Десериализация выполняется через serde_json::Value, а не напрямую в T,
+        // чтобы иметь возможность передать ошибку в хэндлер вместе со свойствами сообщения.
         let result = serde_json::from_value::<T>(content).map_err(Into::into);
         handler.handle(result, properties).await?;
         Ok(())

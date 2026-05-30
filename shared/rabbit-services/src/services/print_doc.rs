@@ -1,3 +1,4 @@
+//! Клиент RabbitMQ для сервиса генерации документов (PrintDoc).
 use std::{sync::Arc, time::Duration};
 
 use broker::rabbit::RabbitAdapter;

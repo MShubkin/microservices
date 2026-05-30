@@ -1,4 +1,18 @@
-//! Тут живёт middleware который проверяет куку/логин
+//! Аутентификация входящих HTTP-запросов.
+//!
+//! Двухэтапная проверка:
+//! 1. `check_query` — извлекает `user_id` из query-параметра (`?user_id=123`).
+//!    Каждый запрос обязан его передавать — это жёсткое требование API.
+//! 2. `get_auth` — проверяет сессию через ViewStorage (monolith):
+//!    - без флага `AUTH_WITHOUT_COOKIE`: токен читается из cookie `session_id`,
+//!      затем проверяется пара `(user_id, session_token)` — это полная проверка;
+//!    - с флагом: вызывается `check_session(user_id)` без токена — для E2E тестов
+//!      и локальной разработки без monolith-а.
+//!
+//! После успешной проверки `user_id` и `user_name` записываются в:
+//! - `RootSpan` — чтобы появиться в tracing-логах текущего запроса;
+//! - `AsezRabbitProperties` — чтобы пропагироваться в RabbitMQ-вызовы;
+//! - `AsezTracingFieldsCollection` — для CEF-аудита.
 use std::sync::Arc;
 
 use actix_http::{
@@ -32,9 +46,22 @@ use rabbit_services::{
     properties::AsezRabbitProperties, view_storage::ViewStorageService,
 };
 
+/// Если установлен в `"true"`, auth-middleware пропускает проверку cookie
+/// и звонит в ViewStorage только с `user_id`. Используется в E2E-тестах,
+/// где браузер не управляет куками, и в среде разработки без monolith-а.
+///
+/// Значение читается один раз при старте процесса (см. [`do_not_check_cookie_flag`])
+/// и кэшируется — изменение переменной во время работы процесса не влияет на поведение.
+/// Это защита от подмены конфига во время работы сервиса (k8s configMap reload,
+/// shell-доступ к контейнеру) — security-флаг не должен переключаться рантайм.
 pub(crate) const AUTH_WITHOUT_COOKIE: &str = "AUTH_WITHOUT_COOKIE";
 
-/// "Сырой материал для конструкции `AsezSessionTransform`.
+/// Маркер-тип для регистрации middleware через `.wrap()`.
+///
+/// В Actix паттерн `Transform + Service` требует два типа: `Transform` создаётся один раз
+/// при сборке App и порождает `Service`-экземпляр для каждого worker-потока. Здесь
+/// `AsezSessionWatcher` — это `Transform`, `AsezSessionTransform` — это `Service`.
+///
 /// Как раз это передаётся в `wrap`, когда строится сервис. Например:
 /// ```ignore
 /// HttpServer::new(move || {
@@ -48,11 +75,13 @@ pub(crate) const AUTH_WITHOUT_COOKIE: &str = "AUTH_WITHOUT_COOKIE";
 #[derive(Debug)]
 pub struct AsezSessionWatcher;
 
-/// Сервис (middleware), который отвечает за логин.
-/// Это внутренний тип, который отвечает за осуществление.
+/// Фактическая реализация middleware для каждого worker-потока.
+///
+/// `Arc<S>` нужен потому, что `call()` возвращает `LocalBoxFuture<'static>`, а значит
+/// future должна сама владеть ссылкой на service — без `Arc` это невозможно из-за борроу-
+/// чекера: `self` не живёт достаточно долго.
 #[derive(Debug)]
 pub struct AsezSessionTransform<S: Service<ServiceRequest>> {
-    /// Сам сервер
     service: Arc<S>,
 }
 
@@ -179,11 +208,30 @@ where
     }
 }
 
+/// Читает флаг `AUTH_WITHOUT_COOKIE` один раз при первом вызове и кеширует результат.
+///
+/// Кеширование критично: иначе любое изменение env (через k8s configMap reload,
+/// shell-доступ к контейнеру) мгновенно отключило бы аутентификацию во всём
+/// кластере без аудит-следа. После старта security-флаг не должен меняться.
+///
+/// При включённом обходе в логи пишется громкий `error!(kind = "siem", ...)` —
+/// это должно срабатывать в SIEM-алертах любой нормальной среды.
 pub(crate) fn do_not_check_cookie_flag() -> bool {
-    std::env::var(AUTH_WITHOUT_COOKIE)
-        .ok()
-        .and_then(|x| x.to_lowercase().parse::<bool>().ok())
-        .unwrap_or_default()
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let enabled = std::env::var(AUTH_WITHOUT_COOKIE)
+            .ok()
+            .and_then(|x| x.to_lowercase().parse::<bool>().ok())
+            .unwrap_or_default();
+        if enabled {
+            error!(
+                kind = "siem",
+                "[SIEM] AUTH_WITHOUT_COOKIE=true — проверка аутентификации по cookie ОТКЛЮЧЕНА (только для dev/E2E)"
+            );
+        }
+        enabled
+    })
 }
 
 #[tracing::instrument(skip_all)]
@@ -213,6 +261,10 @@ async fn get_auth(
         .map_err(|x| SessionError::Permission(x.to_string()))
 }
 
+/// Извлекает `user_id` из query-параметра `?user_id=123`.
+///
+/// Это обязательный параметр — каждый запрос к API должен его передавать.
+/// Отсутствие `user_id` немедленно возвращает 401 ещё до обращения к ViewStorage.
 pub(crate) fn check_query(req: &HttpRequest) -> Result<i32, SessionError> {
     match <Query<AuthQuery>>::from_query(req.query_string()) {
         Ok(user_id) => Ok(user_id.user_id),

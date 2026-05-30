@@ -8,10 +8,23 @@ use syn::{
     WhereClause,
 };
 
-/// # Описание
+/// Derive-макрос для доступа к полям структуры по строковому имени.
 ///
-/// Дерайв макрос для безопасного доступа к полям структуры по
-/// наименованию поля
+/// Зачем нужен: в некоторых частях системы поля структуры нужно обходить динамически
+/// (например, для сериализации в кастомный формат или для построения SQL-запросов
+/// из набора изменённых полей). Rust не предоставляет reflection, поэтому макрос
+/// генерирует его вручную через enum и match.
+///
+/// Генерирует:
+/// - enum `{Struct}Field<'field>` — варианты с `&'field T` для каждого типа поля;
+/// - enum `{Struct}FieldMut<'field>` — то же, но с `&'field mut T`;
+/// - `const FIELDS: [&'static str; N]` — имена полей в порядке объявления;
+/// - `fn field(&self, name: &str) -> Option<{Struct}Field<'_>>` — доступ по имени;
+/// - `fn field_mut(&mut self, name: &str) -> Option<{Struct}FieldMut<'_>>`;
+/// - `fn field_iter(&self) -> impl Iterator<Item = (&'static str, ...)>` — обход полей.
+///
+/// Несколько полей одного типа дадут один вариант enum-а (`String(&'field String)`) —
+/// это намеренно: enum не разрастается, а disambiguация идёт по имени в match arms.
 ///
 /// Также он генерирует `const FIELDS: [&'static str; FIELDS_COUNT]` с полями структуры и
 /// `field_iter` метод, который позволяет итерироваться по полям структуры в том порядке,
@@ -263,7 +276,9 @@ fn generate_iter_impl(
     }
 }
 
-/// Генерация имени варианта енама на основе типа поля
+/// Строит имя варианта enum-а из типа поля.
+/// `String` → `"String"`, `Option<Uuid>` → `"OptionUuid"`, `i64` → `"I64"`.
+/// Примитивы поднимаются в CamelCase, сложные типы очищаются от угловых скобок.
 fn generate_variant_name(ty: &syn::Type) -> String {
     let type_str = ty.to_token_stream().to_string();
     shorten_type(type_str)
@@ -301,7 +316,9 @@ fn shorten_type(type_str: String) -> String {
     }
 }
 
-/// Генерации вариантов енама
+/// Генерирует варианты enum-а — по одному на уникальный тип поля.
+/// `unique_by(variant_ident)` — поля одного типа дают один вариант,
+/// иначе enum разрастался бы при десятках строковых полей.
 fn generate_enum_variants(
     field_map: &[(Ident, Type, Ident)],
     is_mut: bool,
@@ -323,7 +340,8 @@ fn generate_enum_variants(
         .collect()
 }
 
-/// Генерация матч веток
+/// Генерирует ветки `match fieldname { "field_name" => Some(Enum::Variant(&self.field)) }`.
+/// Здесь нет `unique_by` — каждое поле получает свою ветку, даже если тип совпадает.
 fn generate_match_arms(
     field_map: &[(Ident, syn::Type, Ident)],
     value_enum_ident: &Ident,

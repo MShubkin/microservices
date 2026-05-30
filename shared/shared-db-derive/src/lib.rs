@@ -6,44 +6,27 @@ mod item_upsert;
 mod shared;
 mod versioned;
 
-/// Allow a structure "shadow" structure  used for DTO/other logic to be made
-/// from a different declared structure. The structure will have all the fields
-/// of the original, and their types will, by default be the same. The whole purpose
-/// of this macro is to be able to create a "shadow" structure that will be very
-/// similar to the original, so the fewer attributes are used the closer we are
-/// to success!
+/// Генерирует теневую структуру-адаптор (`{Name}Rep`) для передачи данных между
+/// фронтендом и БД через частичные обновления.
 ///
-/// However it can have different types, different field names and it can derive
-/// different traits and use their attributes.
-///  This structure may have different field types to the original. This is not
-/// obligatory, but it is useful.
-/// - `adaptor_type`: as #[adaptor_type = "x"] If the type is different from the original
-///    it will be converted by default with `Into::into`.
-/// - `adaptor_into`: as #[adaptor_into = "function"] If types on item and adaptor
-///   fields differ, this can declare a custom converter function. By default `Into::into` is
-///   used. Adaptor field -> Original field.
-/// - `adaptor_from`: as #[adaptor_from = "function"] If types on item and adaptor
-///   fields differ, this can declare a custom converter function. By default `Into::into` is
-///   used. Original field -> adaptor field.
-/// - `adaptor_try_into`: as #[adaptor_try_into = "function"] declares a fallible function
-///   that is compatible with `?` for converting between field types.
-/// - `adaptor_try_from`: as #[adaptor_try_from = "function"]
-/// - `adaptor_field_duplicate`: as #[adaptor_field_duplicate = "new_name"] will create a
-///   second field that duplicates the first field. The content of the DbItem field will
-///   also be copied into this field. However, these fields never play any role in database
-///   operations.
-/// - `adaptor_rename`: as #[adaptor_rename = "new_name"] Allows either the adaptor structure
-///   or its fields to be renamed. The fields have the same name as their parent
-///   fields by default, the new struct simply has the name of the old structure
-///   with `Rep` appended to the end of it.
-/// - `adaptor_derive`: as #[adaptor_derive(A, B, C)] Allows the adaptor to derive
-///   additional traits that may be useful for it. Thus this becomes `#[derive(A, B, C)]`.
-/// - `adaptor_attributes`: as #[adaptor_attributes(#[serde(default)])], allows the
-///   adaptor to inherit attributes from other traits it derives. In this example, this
-///   becomes `#[serde(default)]`
-/// - `adaptor_attribute_for_all`: as `adaptor_attributes`, but passes the attributes to
-///   ALL fields.
-/// - `adaptor_fields_with_values`: implements DbAdaptorFieldsWithValues trait for adaptor entity
+/// Все поля адаптора имеют тип `Option<T>`: `None` означает "поле не затронуто",
+/// `Some(v)` -- обновить до `v`. Это позволяет фронтенду передавать только
+/// изменённые поля без знания полного состояния записи.
+///
+/// Атрибуты для полей:
+/// - `adaptor_type = "NewType"` -- заменяет тип поля в адапторе.
+/// - `adaptor_into = "fn"` -- кастомная конвертация из адаптора в DbItem (поле -> поле).
+/// - `adaptor_from = "fn"` -- кастомная конвертация из DbItem в адаптор (поле -> поле).
+/// - `adaptor_try_from = "fn"` -- то же, но с `?` (fallible).
+/// - `adaptor_field_duplicate = "new_name"` -- создаёт дополнительное поле как
+///   копию текущего под другим именем. Дублирующие поля не участвуют в DB-операциях.
+/// - `adaptor_rename = "new_name"` -- переименовывает поле или структуру в адапторе.
+///
+/// Атрибуты для структуры:
+/// - `adaptor_derive(A, B, C)` -- дополнительные derive-трейты для адаптора.
+/// - `adaptor_attributes(#[attr])` -- дополнительные атрибуты самой структуры адаптора.
+/// - `adaptor_attribute_for_all(#[attr])` -- атрибут, применяемый ко всем полям.
+/// - `adaptor_fields_with_values` -- реализует `DbAdaptorFieldsWithValues` для экспорта.
 #[proc_macro_derive(
     DbAdaptor,
     attributes(
@@ -64,62 +47,40 @@ pub fn db_adaptor(inp: proc_macro::TokenStream) -> proc_macro::TokenStream {
     adaptor::adaptor_inner(inp)
 }
 
-/// Allow a structure to be inserted, selected and updated in a database.
-/// This derive macro has two necessary attributes:
-/// - `item_table`, used as #[item_table = "table_name"] above the struct name.
-///   a structure can only be tied to one table in this manner. The derivation fails
-///   if this is not declared.
-/// - `item_field_pkey`, used as #[item_field_pkey] above the field that is to be
-///   the primary key. A structure can have multiple keys. This exists to be able to
-///   facilitate both of the following patterns:
+/// Генерирует реализацию трейта [`DbItem`] для структуры, привязанной к таблице PostgreSQL.
 ///
-///   ```sql
-///   CONSTRAINT some_table_pkey PRIMARY KEY (id_field)
-///   ```
+/// Макрос по полям структуры генерирует:
+/// - Константы `TABLE`, `FIELDS`, `PRIMARY_KEYS`, `INSERT_FIELDS`, `UPDATE_FIELDS`,
+///   `PRIMARY_KEY_INDICES`, `NO_UPDATE_INDICES`.
+/// - Методы `bind_pkeys`, `bind_to_query`, `bind_to_query_insert`, `bind_limited_fields`,
+///   `activate_fields`.
+/// - `impl FromRow` для чтения строк результата запроса.
+/// - `impl sqlx::Type` и `impl sqlx::decode::Decode` для использования в JOIN.
+/// - Константы-поля `pub const field_name: &'static str` для типобезопасного
+///   указания полей в `Select::with_fields([Entity::field_name])`.
 ///
-///   ```sql
-///   CONSTRAINT some_table_pkey PRIMARY KEY (id_field, other_id_field)
-///   ```
+/// Обязательные атрибуты:
+/// - `#[item_table = "table_name"]` над структурой -- имя таблицы в БД.
+///   Если не указан, используется snake_case имени структуры.
+/// - `#[item_field_pkey]` над полем -- первичный ключ (можно несколько).
 ///
-///   The derivation fails if this is `item_field_pkey` is not declared.
-///
-/// It also has four additional attributes:
-/// - `db_field_name`, used as #[db_field_name = "new_name"] allows the DB field
-///   name to be independent of the DbItem field name.
-/// - `item_field_autogen`, used as #[item_field_autogen] above the field.
-///   Fields marked thus represent serial and autoincrementing types whose
-///   creation is always handled by the database. They are never inserted
-///   into a table and can only updated or selected. If a field is not tagged
-///   with `item_field_autogen`, it is inserted into the DB on an insert call.
-/// - `item_field_autogen_always`, used as #[item_field_autogen_always] above the field.
-///   Fields marked thus represent types which cannot be inserted or updated (eg GENERATED ALWAYS AS).
-///   They are never inserted or updated and can only be selected. If a field is not tagged
-///   with `item_field_autogen_always`, it can be updated by an update call. The primary key should
-///   not be marked with this attribute, as it may make it impossible to update the item.
-/// - `item_aggr_insert` compiles an alternative insert function that inserts all items
-///   in a vectorised form. This is more efficient for large inserts as only one DB call
-///   is made if there ar more than 65535 binds (between 1000-1000 items), but it is
-///   slower for smaller inserts as all data is cloned into new vectors. Thus, if you
-///   have a small structure which you expect will be inserted truly en masse, this
-///   option should be used.
-/// - `item_field_activate_with` isa bit unusual. Sometimes the type being
-///   inserted into a database might be invalid, eg `Option::None` into a
-///   `NOT NULL` column, or we may wish to initialize a date with `now()` instead of
-///   the default value, or we otherwise require to modify a default value prior to inserting.
-///   This attribute tells the compiler how to activate such fields. In a well
-///   configured DB it should not be needed. By default, fields are not modified prior to
-///   insertion.
-/// - `item_manually_activate_fields`: Вместо `item_field_activate_with` и
-///   `item_manually_activate_fields` можно написать свою `activate_fields_manually`
-///    для всей структуры сразу. Это полезно если есть много очень специфичных правил.
-/// - `item_activate_all_with` действует как `item_field_activate_with` но пишется
-///   над структурой и действует для всех полей.
-/// - `item_field_required`: При генерации `FromRow` в исходных данных должно
-///   присутствовать данное поле (или все поля).
-/// - item_skip_field_tolerance: Usually FieldTolerance is automatically derived and
-///   does nothing. However, it may be desirable to manually derive the trait in order
-///   to tolerate some renamed fields from the frontend. In that case this attribute
-///   is applied and the trait MUST be derived manually.
+/// Дополнительные атрибуты:
+/// - `#[db_field_name = "col_name"]` -- имя колонки в БД отличается от имени поля.
+/// - `#[item_field_autogen]` -- поле генерируется БД (SERIAL/AUTOINCREMENT),
+///   не вставляется при INSERT, но доступно для UPDATE.
+/// - `#[item_field_autogen_always]` -- поле вычисляется БД (`GENERATED ALWAYS AS`),
+///   не вставляется и не обновляется никогда.
+/// - `#[item_aggr_insert]` -- генерирует UNNEST-версию `insert_vec`/`update_vec`,
+///   эффективную для массовых вставок больших объёмов данных.
+/// - `#[item_field_activate_with = "expr"]` -- выражение для инициализации поля
+///   перед INSERT если оно равно дефолту (вместо `Default::default()`).
+/// - `#[item_activate_all_with = "expr"]` -- то же, но применяется ко всем полям.
+/// - `#[item_manually_activate_fields]` -- вместо авто-активации вызывается
+///   `activate_fields_manually()`, которую нужно написать вручную.
+/// - `#[item_field_require_from_row]` -- поле обязательно в `SELECT`, иначе ошибка
+///   декодирования. Отключает `DbItemPartialSelect` для этой структуры.
+/// - `#[item_skip_field_tolerance]` -- пропускает авто-генерацию `FieldTolerance`;
+///   трейт нужно реализовать вручную с заполненным `TOLERATED`.
 #[proc_macro_derive(
     DbItem,
     attributes(
@@ -140,67 +101,63 @@ pub fn db_item(inp: proc_macro::TokenStream) -> proc_macro::TokenStream {
     item::item_inner(inp)
 }
 
-/// Derives the `DbItemExt` trait, which is contains helper functions for working
-/// with fields of a structure while agnostic to what the structure itself is.
+/// Генерирует реализацию трейта `DbItemExt`, предоставляющего вспомогательные
+/// функции для работы с полями структуры в агностичном относительно типа виде.
 ///
-/// It is useful for automated implementation of various checks and processes inside
-/// the processing service.
+/// Используется в сервисном слое для автоматизации проверок и обработки полей.
 #[proc_macro_derive(DbItemExt)]
 pub fn db_item_ext(inp: proc_macro::TokenStream) -> proc_macro::TokenStream {
     item_ext::inner(inp)
 }
 
-/// Derives the `DbUpsert` trait, which allows the "INSERT .. ON CONFLICT DO UPDATE"
-/// statement.
+/// Генерирует реализацию трейта `DbUpsert` для операции `INSERT ... ON CONFLICT DO UPDATE`.
 ///
-/// У этого дерайва есть один аттрибут.
-/// - `item_aggr_upsert`: Создаёт как UNNEST, что теоретический более производительно,
-///   но не работает для записи у которых есть поля массивы.
+/// Атрибут:
+/// - `#[item_aggr_upsert]` -- использует UNNEST для массового upsert.
+///   Более производительно в теории, но не работает для полей-массивов.
 #[proc_macro_derive(DbUpsert, attributes(item_aggr_insert))]
 pub fn db_item_upsert(inp: proc_macro::TokenStream) -> proc_macro::TokenStream {
     item_upsert::inner(inp)
 }
 
-/// Derives the `DbVersioned` Trait, which creates a struct that is identical, except it also
-/// contains a field with the name of `pricing_version`. The primary key then becomes
-/// `id` + `pricing_version`. "Version" is suffixed to the name of the original structure.
+/// Генерирует структуру версионной сущности и конвертации между ней и оригиналом.
 ///
-/// The new structure only has the bare minimum derive attributes to function as
-/// a DbItem.
+/// Создаёт `{Name}Version` -- копию структуры с дополнительным полем `pricing_version: i16`.
+/// Первичный ключ версионной структуры: `id` + `pricing_version`.
 ///
-/// Additionally the macro generates a helper function to convert between
-/// itself and the new _Version structure. The derive macro creates the function and reverse_function:
+/// Генерируются методы:
 /// ```ignore
 /// impl Original {
-///     fn to_versioned(&self, pricing_version: i16) -> VersionedItem;
+///     fn to_versioned(&self, pricing_version: i16) -> OriginalVersion;
 /// }
-/// impl Versioned {
+/// impl OriginalVersion {
 ///     fn to_active(&self) -> Original;
 /// }
 /// ```
-/// The versioned may contain fields that the original does not, however the original
-/// may not contain fields that versioned does not. This is done in keeping with our
-/// development process.
 ///
-/// Attributes:
-/// - `db_version_table`: Indicates which table is used for the version structure.
+/// Версионная структура может содержать поля, которых нет в оригинале.
+/// Оригинал не должен содержать полей, которых нет в версионной структуре.
+///
+/// Атрибут:
+/// - `#[db_version_table = "table_name"]` -- имя версионной таблицы.
 #[proc_macro_derive(DbVersioned, attributes(versioned, db_version_table))]
 pub fn versioned(inp: proc_macro::TokenStream) -> proc_macro::TokenStream {
     versioned::inner(inp)
 }
 
-/// Дерайв макрос для енама, который описывает перечень возможных значений колонки.
+/// Генерирует вспомогательные реализации для enum, представляющего
+/// перечисление возможных значений колонки в БД.
 ///
-/// Для указания варианта енама по дефолту в базе данных, надо указать атрибутом #\[db_default\]
-/// на вариант енама. Также важно добавить #\[repr(...)\], чтобы значение можно было преобразовывать свободно
-/// в число
+/// Для указания варианта по умолчанию используется `#[db_default]` на нужном варианте.
+/// Обязателен `#[repr(i16)]` (или другой числовой repr) для конвертации в число.
 ///
 /// Генерируемые имплементации для `Enum`:
-/// 1. [`Default`] со значением варианта, помеченного #\[db_default\]
-/// 2. [`From<Enum>`] for `repr`
-/// 3. [`From<repr>`] for `Enum`
-/// 4. [`From<Enum>`] for [`asez2_shared_db::Value`]
-///
+/// 1. [`Default`] со значением варианта, помеченного `#[db_default]`
+/// 2. `From<Enum>` for `repr` (конвертация в число)
+/// 3. `From<repr>` for `Enum` (конвертация из числа; неизвестные значения -> default)
+/// 4. `From<Enum>` for `asez2_shared_db::Value`
+/// 5. `EnumDiscriminant` -- таблица соответствия вариантов их числовым значениям
+/// 6. `PgHasArrayType` для поддержки PostgreSQL-массивов
 #[proc_macro_derive(DbEnum, attributes(db_default))]
 pub fn db_enumeration(inp: proc_macro::TokenStream) -> proc_macro::TokenStream {
     enumeration::db_enumeration_inner(inp)

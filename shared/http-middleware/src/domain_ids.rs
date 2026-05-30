@@ -16,19 +16,18 @@ use tracing::field::display;
 use tracing_actix_web::RootSpan;
 use uuid::Uuid;
 
-/// Service that extracts domain identifiers (IDs, UUIDs) from a request.
+/// Middleware, которая извлекает числовые идентификаторы бизнес-объектов из запроса
+/// и записывает их в `AsezTracingFieldsCollection` и в корневой span для аудита.
 ///
-/// For GET requests, ID is extracted from the path parameter.
+/// Для GET: id берётся из path-параметра (`/entity/{id}`).
+/// Для POST с JSON: парсятся поля `id`/`plan_id`/`uuid` и массив `item_list`.
+/// Двухуровневый парсинг нужен потому, что в системе два паттерна:
+/// - одиночные операции — `{ "id": 123 }`
+/// - групповые операции — `{ "item_list": [{ "id": 1 }, { "id": 2 }] }`
 ///
-/// For POST requests, IDs and UUIDs are extracted from the request body, using these patterns:
-///
-/// ```ignore
-/// { "id": XXX, "uuid": "YYYYYYYY-YYYY-YYYY-YYYYYYYYYYYY" }
-/// ```
-///
-/// ```ignore
-/// { "item_list": [{ "id": XXX, "uuid": "YYY"}]}
-/// ```
+/// После чтения тела POST оно восстанавливается обратно в payload через `Payload::create`
+/// + `unread_data` — иначе handler-у придёт пустое тело. Это стандартный трюк
+/// в Actix когда middleware нужно заглянуть в body без его потребления.
 pub struct DomainIDsService<S> {
     service: Rc<S>,
 }
@@ -103,6 +102,8 @@ fn extract_ids(value: &Value, ids: &mut Vec<i64>, uuids: &mut Vec<Uuid>) {
     extract_uuid(value, uuids);
 }
 
+/// Ищет числовой id по двум именам: `id` — стандартное поле, `plan_id` — историческое
+/// поле из старых endpoint-ов, которые ещё не переименованы. Берётся только первое совпадение.
 fn extract_id(value: &Map<String, Value>, ids: &mut Vec<i64>) {
     for name in ["id", "plan_id"] {
         if let Some(id) = value.get(name).and_then(Value::as_i64) {
@@ -137,9 +138,7 @@ fn extract_item_list(item_list: &Value, ids: &mut Vec<i64>, uuids: &mut Vec<Uuid
     }
 }
 
-/// Transformation for extracting domain identifiers from a request.
-///
-/// See [`DomainIDsService`](DomainIDsService) for more details.
+/// Маркер-тип для регистрации через `.wrap()`. Создаёт `DomainIDsService` для каждого worker-а.
 pub struct DomainIDsTransform;
 
 impl<S: 'static, B> Transform<S, ServiceRequest> for DomainIDsTransform

@@ -300,9 +300,11 @@ async fn fetch_org_users(
     Ok(res)
 }
 
-lazy_static::lazy_static!(
-    pub(crate) static ref ORGANIZATIONAL_USER_ASSIGNMENT: RwLock<Option<SearchData>> = RwLock::new(Default::default());
-);
+// `LazyLock` стабилизирован в std с Rust 1.80 — отказ от `lazy_static!`-крейта
+// устраняет proc-macro зависимость и делает инициализацию явной.
+pub(crate) static ORGANIZATIONAL_USER_ASSIGNMENT: std::sync::LazyLock<
+    RwLock<Option<SearchData>>,
+> = std::sync::LazyLock::new(|| RwLock::new(None));
 
 /// Запускает таску, обновляющую кеш организационных назначений пользователей.
 pub(crate) async fn run_refresh_organizational_user_assignment(

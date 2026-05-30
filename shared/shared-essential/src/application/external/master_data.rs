@@ -96,7 +96,7 @@ pub async fn get_multiple_master_data(
 
     let response: ApiResponse =
         serde_json::from_str(response.as_str()).map_err(|err| {
-            eprintln!("Ошибка десериализации: {:?}", err);
+            tracing::error!(kind = "integration", error = %err, "ошибка десериализации ответа master-data");
             IntegrationError::Format(
                 "Can't deserialize a get_multiple response".to_string(),
             )

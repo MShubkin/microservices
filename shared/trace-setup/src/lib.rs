@@ -1,16 +1,11 @@
-//! This is a micro-library that contains shared tracing setup that is used by
-//! multiple services.
+//! Инициализация логирования для сервисов, использующих CEF-формат.
 //!
-//! The reason that it is separate is that shared-essential is becoming quite large
-//! which is an unfavorable factor for compile time. This library has very little in
-//! common with shared-essential, which means that it can be compiled prior or in
-//! parallel which will improve project build time.
+//! Вынесено в отдельный крейт, а не в `shared-essential`, по причине компиляции:
+//! `shared-essential` большой и тянет много зависимостей, поэтому всё, что можно
+//! скомпилировать параллельно с ним — лучше вынести. `trace-setup` зависит только
+//! от `igg-tracing` и компилируется независимо.
 //!
-//! It is also much easier to find the functionality here.
-//!
-//! Currently the services that use this setup are:
-//! 1. processing
-//! 2. plan-db
+//! Сейчас используется в: `processing`, `plan-db`.
 
 use std::path::{Path, PathBuf};
 
@@ -21,17 +16,27 @@ use tracing_bunyan_formatter::{BunyanFormattingLayer, JsonStorageLayer};
 
 use igg_tracing::{CEFTracingLayer, ServiceDescription};
 
-/// Conventional operations in SRM are "read", "update", "download", however,
-/// "read" and "download" are ambiguously close together, and there are no cases
-/// as of yet where we read without downloading, so "get", "update" and "insert"
-/// are used instead.
+/// CEF-фильтр для операций доступа к данным — попадают в access-лог SIEM.
+///
+/// "read" и "download" объединены в "get", чтобы не плодить категории для
+/// операций, которые в нашей системе всегда идут вместе.
 pub const ACCESS_OPS: &[&str] = &["get", "insert", "update"];
-/// It is not clear that we need this yet. However once messages
-/// contain logon information, we will definitely need it.
+
+/// CEF-фильтр для событий безопасности — будет использован когда сообщения
+/// RabbitMQ начнут содержать информацию о входах/выходах пользователей.
 pub const SECURITY_OPS: &[&str] = &["users"];
 const VENDOR: &str = "gazprom.ru";
 const SERVICE: &str = "srm";
 
+/// Создаёт CEF-слой, пишущий в файл.
+///
+/// UTC+3 (Москва) захардкожен — SIEM-система ожидает локальное московское время
+/// в метках CEF, и менять это через конфиг смысла нет пока система развёрнута
+/// только в российском контуре.
+///
+/// Возвращает `WorkerGuard` — его нужно хранить живым до завершения процесса.
+/// При дропе guard ждёт, пока буфер non-blocking writer не опустеет, чтобы
+/// не потерять последние строки лога при shutdown.
 pub fn new_cef<'a>(
     service: &ServiceDescription,
     path: impl AsRef<Path>,
@@ -44,6 +49,8 @@ pub fn new_cef<'a>(
     )
 }
 
+/// Создаёт CEF-слой, пишущий в stdout. Используется в режиме `Cef` (LOGGER_MODE=1),
+/// когда логи собирает docker/k8s из stdout вместо монтирования файловой системы.
 pub fn new_cef_stdout<'a>(
     service: &ServiceDescription,
     ops: &'a [&'a str],
@@ -54,17 +61,18 @@ pub fn new_cef_stdout<'a>(
     )
 }
 
-/// Determines whether we trace at all, and if we do, whether it is
-/// simple logging or igg-tracing
+/// Режим логирования сервиса.
+///
+/// Читается из `LOGGER_MODE` через `TracingCfg::from_env()`.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub enum TracingKind {
+    /// Логирование отключено (LOGGER_MODE=0 или не задан). Используется в unit-тестах.
     None,
-    /// This is the preferred output format for during development
+    /// Человекочитаемый вывод в stdout — для локальной разработки (LOGGER_MODE=2 | "normal").
     Normal,
-    /// For CEF formatting: `stdout` is used for CEF formatted output.
+    /// CEF в stdout — для контейнерных окружений, где логи забирает агент (LOGGER_MODE=1 | "cef").
     Cef,
-    /// For CEF formatting: `path` is used as the CEF ouput
-    /// and JSON-formatted log is sent to `stdout`.
+    /// CEF в файл + JSON в stdout одновременно — для продакшна с SIEM-интеграцией (LOGGER_MODE=3 | "json_cef").
     JsonCef {
         path: PathBuf,
     },
@@ -77,6 +85,14 @@ impl Default for TracingKind {
 }
 
 impl TracingKind {
+    /// Инициализирует глобальный tracing subscriber и возвращает корневой span.
+    ///
+    /// Корневой span нужен сервисам без HTTP-сервера (processing, plan-db) — в них нет
+    /// `ServiceRootSpanBuilder`, который создаёт span на каждый запрос. Вместо этого
+    /// один долгоживущий span охватывает весь процесс, и CEF-события привязываются к нему.
+    ///
+    /// Возвращённые `guards` нужно хранить до конца `main()`. Дроп guard-а запускает
+    /// flush non-blocking writer-а — без этого последние строки лога могут пропасть.
     pub fn initiate_log(
         &self,
         _service_name: &str,
@@ -92,7 +108,6 @@ impl TracingKind {
             "user_agent" = "Unknown",
             "user_code" = "Unknown",
             "source_ip" = &own_ip as &str,
-            // Technically uses a port to contact plans.
             "source_port" = port,
             "request_id" = "none",
         );
@@ -131,7 +146,7 @@ impl TracingKind {
     }
 }
 
-/// This type is here so that we do not have to use tracing-appender in every crate.
+/// Алиас для удобства — чтобы каждый сервис не тащил `tracing-appender` напрямую.
 pub type TracingSetupResult = Result<(Vec<AppenderGuard>, Span), TsError>;
 
 #[derive(thiserror::Error, Debug)]

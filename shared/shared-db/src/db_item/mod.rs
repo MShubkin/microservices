@@ -34,15 +34,15 @@ pub use versioned::DbVersioned;
 #[cfg(test)]
 mod tests;
 
-/// Converts the field array into a representation of the bindings.
+/// Преобразует массив полей в строку placeholder'ов для VALUES-выражения.
 ///
-/// The `nth` argument tells us which item this is in the list that the counter may
-/// be adjusted correctly.
-/// eg `["id", "name", "address"] becomes `"($1,$2,$3)"`.
-/// TODO: Convert into a proc macro.
+/// Аргумент `nth` указывает порядковый номер строки в массовой вставке,
+/// чтобы счётчик `$N` не сбрасывался на единицу между строками.
+/// Пример: `["id", "name", "address"]` при `nth=1` → `"($4,$5,$6)"`.
+/// TODO: Перенести в proc-macro для устранения накладных расходов в рантайме.
 pub fn field_counter(fields: &[&str], nth: usize) -> String {
     let mut output = String::with_capacity(fields.len() + 1);
-    // Remember, SQl queries index starting at 1, eg ($1,$2).
+    // SQL нумерует привязки с 1, поэтому offset начинается с 1.
     let offset = fields.len() * nth + 1;
 
     output.push('(');
@@ -55,14 +55,14 @@ pub fn field_counter(fields: &[&str], nth: usize) -> String {
     output
 }
 
-/// A trait that allows checking and renaming of fields in select queries.
-/// It is used to tolerate certain fields with "incorrect" or "front end correct"
-/// names.
+/// Трейт для обратной совместимости полей между фронтендом и бэкендом.
 ///
-/// The only thing that the user needs to do to implement this trait is to write out
-/// the mapping constant.
+/// Фронтенд иногда использует имена полей, отличающиеся от реальных имён
+/// колонок в БД (например, переименованные поля после рефакторинга).
+/// Трейт позволяет задать таблицу переименований [`TOLERATED`] и применить
+/// её к [`Select`] перед выполнением запроса, не меняя API фронтенда.
 pub trait FieldTolerance {
-    /// Frontend field is first, backend field is second.
+    /// Пары `(имя_фронтенда, имя_бэкенда)`.
     const TOLERATED: &'static [(&'static str, &'static str)] = &[];
 
     fn apply_tolerance_to_select(s: &mut Select) {
@@ -85,10 +85,10 @@ pub trait FieldTolerance {
         fields.iter().map(|x| map_field(x)).collect()
     }
 
-    /// Переводит толерантное наименование в актуальное для сущности
+    /// Переводит толерантное наименование в актуальное для сущности.
     ///
     /// Если было передано актуальное или в принципе невалидное поле для сущности,
-    /// то оно и будет возвращено
+    /// то оно и будет возвращено.
     fn actual_fieldname(fieldname: &str) -> &str {
         Self::TOLERATED
             .iter()
@@ -98,27 +98,37 @@ pub trait FieldTolerance {
     }
 }
 
+/// Возвращает поля для UPDATE с учётом маски: включает первичные ключи,
+/// исключает поля с `GENERATED ALWAYS AS` (autogen_always).
 pub fn update_fields_helper<D: DbItem>(mask: &DbFieldMask<D>) -> Vec<&'static str> {
     mask.clone().with_pkeys().without_autogen().to_fields()
 }
 
-/// Маска полей для update -- указанные поля минус autogen_always.
+/// Маска полей для SET-части UPDATE: указанные поля минус autogen_always.
+/// Первичные ключи в SET не входят -- они уходят в WHERE.
 pub fn update_set_fields_helper<D: DbItem>(
     mask: &DbFieldMask<D>,
 ) -> Vec<&'static str> {
     mask.clone().without_autogen().to_fields()
 }
 
+/// Возвращает поля для SELECT: просто все включённые в маску поля.
 pub fn select_fields_helper<D: DbItem>(mask: &DbFieldMask<D>) -> Vec<&'static str> {
     mask.to_fields()
 }
 
-/// Reverse of update_fields_helper.
+/// Строит маску привязки по именам полей, автоматически включая первичные ключи.
+///
+/// Обратная операция к [`update_fields_helper`]: по именам полей
+/// восстанавливает битовую маску, готовую к передаче в `bind_limited_fields`.
 pub fn make_bind_mask<D: DbItem>(selected_fields: &[&str]) -> DbFieldMask<D> {
     DbFieldMask::make_bind_mask(selected_fields)
 }
 
-/// Reverse of update_fields_helper.
+/// Строит маску привязки для одиночного UPDATE.
+///
+/// Отличается от [`make_bind_mask`] тем, что исключает autogen_always поля,
+/// которые нельзя обновлять напрямую.
 pub fn make_single_update_bind_mask<D: DbItem>(
     selected_fields: &[&str],
 ) -> DbFieldMask<D> {

@@ -1,7 +1,12 @@
-//! This module contains the unified configuration parser.
-//! It is preferable to have this in one place since all services/modules
-//! Use env variables for configuration, and for ease of deployment they
-//! should be the same for all components.
+//! Единая точка чтения конфигурации из переменных окружения.
+//!
+//! Все сервисы читают конфиг через этот крейт — так переменные не дублируются
+//! и гарантировано совпадают между микросервисами одного деплоя.
+//!
+//! Паттерн: каждая структура конфига (`RabbitCfg`, `ServerCfg`, ...) имеет метод
+//! `from_env()`, который читает нужные переменные и возвращает `Result<Self, EnvError>`.
+//! Вспомогательные функции `var()` и `try_get()` дают понятные сообщения об ошибках
+//! (в т.ч. имя переменной, которой не хватает) вместо паники.
 mod time;
 pub use crate::time::{TimeParseError, TimeWithOffset};
 
@@ -66,6 +71,10 @@ pub const MASTER_DATA_BASE_URL: &str = "MASTER_DATA_BASE_URL";
 pub const MONOLITH_BASE_URL: &str = "MONOLITH_BASE_URL";
 pub const MONOLITH_TECH_USER_ID: &str = "MONOLITH_TECH_USER_ID";
 
+/// Читает переменную `$var` и парсит в тип `$tpe`, или использует `$default`.
+///
+/// Отличие от `try_get()`: принимает имя переменной как идентификатор (константу),
+/// а не строку — это избавляет от дублирования строк там, где уже есть константа.
 #[macro_export]
 macro_rules! try_get {
     ($var:ident, $default:expr, $tpe:ty) => {
@@ -152,10 +161,16 @@ pub struct EnvCfg {
     pub logger: TracingCfg,
 }
 
-/// A deserializable structure representing the connection settings of
-/// our dear rabbit.
-/// NB: We implement deserialize for certain integration tests.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+/// Конфигурация подключения к RabbitMQ.
+///
+/// `Deserialize` реализован для интеграционных тестов, которые загружают конфиг
+/// из TOML/JSON-фикстур вместо реальных переменных окружения.
+///
+/// `retries`/`retry_interval_ms` — параметры повторного подключения при старте.
+/// Дефолт 10 попыток × 100ms = 1 секунда, что достаточно для Docker-compose
+/// где RabbitMQ стартует чуть позже сервиса.
+// `Debug` реализован вручную (см. ниже), чтобы пароль не утекал в логи.
+#[derive(Clone, Deserialize, PartialEq)]
 pub struct RabbitCfg {
     pub host: String,
     pub port: u16,
@@ -164,6 +179,20 @@ pub struct RabbitCfg {
     pub vhost: String,
     pub retries: u32,
     pub retry_interval_ms: u64,
+}
+
+impl std::fmt::Debug for RabbitCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RabbitCfg")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("pw", &"<redacted>")
+            .field("vhost", &self.vhost)
+            .field("retries", &self.retries)
+            .field("retry_interval_ms", &self.retry_interval_ms)
+            .finish()
+    }
 }
 
 impl RabbitCfg {
@@ -183,23 +212,24 @@ impl RabbitCfg {
     }
 }
 
-/// A universal configuration for the main server of services that use a server.
-/// NB: We implement deserialize for certain integration tests.
+/// Конфигурация HTTP-сервера.
+///
+/// `max_conn_per_worker` ограничен до 1000 вместо actix-дефолта 25000 — потому что
+/// при 25000 соединениях на worker первый же DDoS или медленный клиент выедает весь
+/// файловый дескриптор процесса. 1000 — более консервативное ограничение для API-сервиса.
+///
+/// `blocking_threads_per_worker` = 2 — почти все операции async, blocking-потоки нужны
+/// только для редкого sync-IO (чтение файлов, некоторые FFI-вызовы). Больше двух —
+/// это уже пустые потоки, которые съедают память стека.
+///
+/// `Deserialize` — для тестовых фикстур.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ServerCfg {
     pub host: String,
     pub port: u16,
-    /// This sets the maximum number of worker threads.
     pub workers: usize,
-    /// This sets the maximum number of connections per worker,
-    /// the default being 25000 for actix, which is probably too much here.
     pub max_conn_per_worker: usize,
-    /// Most of our services probably do not need many blocking threads since most
-    /// operations are expected to take microseconds, so it is worth keeping
-    /// this low.
     pub blocking_threads_per_worker: usize,
-    /// This determines how many worker threads the server
-    /// runtime spawns on startup. May be useful.
     pub server_thread_count: u8,
 }
 
@@ -225,21 +255,45 @@ impl ServerCfg {
     }
 }
 
-/// NB: We implement deserialize for certain integration tests.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+/// Конфигурация пула соединений PostgreSQL.
+///
+/// `conn_refresh_interval_s` = 3600 — SQLx не умеет сам обнаруживать разрывы TCP-соединений
+/// (например, при перезапуске PG или сетевых таймаутах файрвола). Раз в час соединения
+/// переоткрываются превентивно, чтобы не получить `connection reset` в продакшне.
+///
+/// `min_connections` = 1 — держим одно прогретое соединение даже в простое.
+/// `max_connections` = 4 — каждый worker Actix держит свой пул, итого worker×4 соединений
+/// на сервис. Больше не нужно: у нас не read-heavy нагрузка, а короткие transactional запросы.
+///
+/// `Deserialize` — для тестовых фикстур.
+// `Debug` — вручную, чтобы скрыть пароль.
+#[derive(Clone, Deserialize, PartialEq)]
 pub struct PostgresCfg {
-    /// The postgres server address
     pub host: String,
     pub port: u16,
     pub user: String,
     pub pw: String,
     pub db_name: String,
-    /// The minimum number of connections a pool should fetch
     pub min_connections: u32,
-    /// The maximum number of connections a pool should fetch
     pub max_connections: u32,
     pub conn_timeout_s: u32,
     pub conn_refresh_interval_s: u64,
+}
+
+impl std::fmt::Debug for PostgresCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresCfg")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("pw", &"<redacted>")
+            .field("db_name", &self.db_name)
+            .field("min_connections", &self.min_connections)
+            .field("max_connections", &self.max_connections)
+            .field("conn_timeout_s", &self.conn_timeout_s)
+            .field("conn_refresh_interval_s", &self.conn_refresh_interval_s)
+            .finish()
+    }
 }
 
 impl PostgresCfg {
@@ -261,9 +315,8 @@ impl PostgresCfg {
         })
     }
 
-    /// db address format example: postgres://username:password@localhost:5432/dbname
     pub fn get_connection_string(&self) -> String {
-        // also i wish we just had a connection string in env instead of 5 vars
+        // отдельные переменные вместо connection string — исторически, для обратной совместимости
         format!(
             "postgres://{}:{}@{}:{}/{}",
             self.user, self.pw, self.host, self.port, self.db_name
@@ -271,13 +324,26 @@ impl PostgresCfg {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+// `Debug` — вручную, чтобы скрыть пароль SMTP.
+#[derive(Clone, PartialEq)]
 pub struct MailerCfg {
     pub login: String,
     pub pw: String,
     pub sender: Address,
     pub stmp_server: String,
     pub port: u16,
+}
+
+impl std::fmt::Debug for MailerCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MailerCfg")
+            .field("login", &self.login)
+            .field("pw", &"<redacted>")
+            .field("sender", &self.sender)
+            .field("stmp_server", &self.stmp_server)
+            .field("port", &self.port)
+            .finish()
+    }
 }
 
 impl MailerCfg {
@@ -292,7 +358,9 @@ impl MailerCfg {
     }
 }
 
-/// NB: We implement deserialize for certain integration tests.
+/// Конфигурация режима логирования.
+///
+/// `Deserialize` — для тестовых фикстур.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct TracingCfg {
     pub tracing_kind: trace_setup::TracingKind,
@@ -302,6 +370,8 @@ impl TracingCfg {
     pub fn from_env() -> Result<Self, EnvError> {
         let mode =
             var(LOGGER_MODE).unwrap_or_else(|_| "0".to_string()).to_lowercase();
+        // Числовые коды оставлены для обратной совместимости с ansible-скриптами,
+        // которые передают "1"/"2"/"3". Текстовые алиасы — для читаемости в docker-compose.
         let tracing_kind = match mode.as_ref() {
             "2" | "normal" => TracingKind::Normal,
             "1" | "cef" => TracingKind::Cef,
@@ -394,7 +464,11 @@ where
     Url::parse(maybe_url).map_err(serde::de::Error::custom)
 }
 
-/// Конфигурация для `String` и `Bytes` payload для http сервера
+/// Ограничение размера тела запроса (bytes/string payload).
+///
+/// Отдельный лимит от `JsonConfig` — потому что multipart/form-data и
+/// бинарные тела требуют других пределов, чем JSON-API.
+/// `None` означает actix-дефолт (256KiB для payload, 32KiB для JSON).
 #[derive(Clone, Debug)]
 pub struct PayloadConfig {
     limit: Option<usize>,
@@ -416,7 +490,10 @@ impl PayloadConfig {
     }
 }
 
-/// Конфигурация для `String` и `Bytes` payload для http сервера
+/// Ограничение размера JSON-тела запроса.
+///
+/// Отдельный лимит нужен, чтобы разрешить загрузку больших файлов через `PayloadConfig`
+/// и при этом не пускать гигантские JSON-запросы, которые никогда не должны быть большими.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct JsonConfig {
     limit: Option<usize>,

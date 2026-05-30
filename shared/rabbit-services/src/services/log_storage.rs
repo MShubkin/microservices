@@ -1,3 +1,4 @@
+//! Клиент RabbitMQ для сервиса хранения логов (log-storage). Используется LogStorageCallback.
 use std::sync::Arc;
 
 use broker::{rabbit::RabbitAdapter, BrokerAdapter, Publisher};

@@ -11,13 +11,19 @@ use crate::Consumer;
 
 use super::RabbitChannel;
 
-/// Базовый долгоживущий консьюмер RabbitMQ
+/// Долгоживущий консьюмер RabbitMQ.
+///
+/// `rx` получает сообщения от `amqprs` через `mpsc`-канал: библиотека
+/// доставляет входящие фреймы во внутренний таск и кладёт результат в этот receiver.
+/// `channel` хранится рядом, чтобы отправлять ack/nack по тому же AMQP-каналу,
+/// через который пришло сообщение — AMQP требует, чтобы ack шёл по тому же каналу.
 pub struct RabbitConsumer {
-    /// Канал для получения сообщений
+    /// Получатель сообщений от внутреннего `amqprs`-таска.
     rx: UnboundedReceiver<ConsumerMessage>,
-    /// Канал для общения с RabbitMQ сервером
+    /// AMQP-канал для отправки ack/nack и взаимодействия с брокером.
     channel: RabbitChannel,
-    /// Мануальное отправление acknowledgement
+    /// Если `false` — брокер сам считает сообщение подтверждённым после доставки (no-ack режим).
+    /// Если `true` — нужно явно вызвать `send_ack` или `send_nack`.
     manual_ack: bool,
 }
 
@@ -47,14 +53,18 @@ impl RabbitConsumer {
     }
 }
 
-/// Сообщение RabbitMQ, содержащее контент, метадату доставки и метаданные
+/// Входящее AMQP-сообщение с уже десериализованным payload.
+///
+/// `delivery` содержит `delivery_tag`, который нужен для ack/nack.
+/// `properties` даёт доступ к `correlation_id`, `reply_to` и другим заголовкам AMQP —
+/// они необходимы на стороне RPC-сервера для формирования ответа.
 #[derive(Debug)]
 pub struct RabbitMessage<C> {
-    /// Контент сообщения
+    /// Десериализованное тело сообщения.
     pub content: C,
-    /// Информация о доставке
+    /// Метаданные доставки: `delivery_tag`, `exchange`, `routing_key`.
     pub delivery: Deliver,
-    /// Метаданные сообщения
+    /// Заголовки AMQP: `content_type`, `reply_to`, `correlation_id`, `expiration` и др.
     pub properties: BasicProperties,
 }
 

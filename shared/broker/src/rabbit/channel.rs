@@ -21,28 +21,35 @@ use crate::RetryArgs;
 
 use super::RabbitMessage;
 
-/// Обертка над [amqprs::Channel] канал RabbitMQ
+/// Обёртка над [`amqprs::Channel`] с ретраем, коллбэками и удобными методами ack/nack/publish.
+///
+/// Поля `pub(crate)`, а не `pub`, чтобы `consumer` и `publisher` могли читать их напрямую,
+/// но внешний код не мог нарушить инварианты (например, подменить `retry_args` на ходу).
 pub struct RabbitChannel {
-    /// [amqprs::Channel] канал RabbitMQ
+    /// Базовый AMQP-канал из `amqprs`.
     pub(crate) channel: Channel,
-    /// Аргументы для механизма ретрая
+    /// Аргументы ретрая унаследованы от `RabbitAdapter` при открытии канала.
     pub(crate) retry_args: RetryArgs,
-    /// Коллбэки
+    /// Коллбэки, вызываемые после каждой успешной публикации.
+    /// Хранятся как `Box<dyn Trait>`, чтобы поддерживать разные типы коллбэков одновременно.
     pub(crate) callbacks: Vec<Box<Callback>>,
 }
 
+/// Псевдоним для удобства: убирает дублирование `dyn RabbitChannelCallback + Send`.
 pub type Callback = dyn RabbitChannelCallback + Send;
 
-/// Коллбэк для операций на канале
+/// Хук, вызываемый после публикации сообщения в канал.
 ///
-/// Если же коллбэк вернет ошибку, то операция вернет ошибку
+/// Если коллбэк вернёт `Err`, то `basic_publish` тоже вернёт `Err` —
+/// это позволяет реализовывать логику вроде логирования метрик с возможностью
+/// сигнализировать об ошибке.
 ///
-/// [`DynClone`] используется для того, чтобы коллбэки можно было легко
-/// клонировать
+/// Метод `on_publish` имеет дефолтную реализацию `Ok(())`, чтобы не обязывать
+/// каждого имплементора переопределять все хуки.
 #[async_trait]
 #[allow(unused_variables)]
 pub trait RabbitChannelCallback: Sync {
-    /// Коллбэк, который будет вызван при успешной отправке сообщения
+    /// Вызывается после того, как сообщение успешно отправлено в брокер.
     async fn on_publish(
         &self,
         channel: &RabbitChannel,
@@ -54,7 +61,11 @@ pub trait RabbitChannelCallback: Sync {
 }
 
 impl RabbitChannel {
-    pub fn new(
+    /// Конструктор намеренно `pub(crate)`: канал должен создаваться только через
+    /// [`RabbitAdapter`](super::RabbitAdapter), который наследует свои `retry_args`
+    /// и контролирует жизненный цикл базового `amqprs::Channel`. Внешнее создание
+    /// позволило бы обойти политику ретрая (например, `attempts = 0`).
+    pub(crate) fn new(
         channel: Channel,
         retry_args: RetryArgs,
         callbacks: Vec<Box<Callback>>,
@@ -134,15 +145,26 @@ impl RabbitChannel {
     where
         C: for<'de> Deserialize<'de>,
     {
-        // None возвращается, когда все половинки-отправители удаляются, указывая на то,
-        // что никакие другие значения не могут быть отправлены по каналу.
-        // Механизм ретрая здесь не используется, так как ошибка возникает только
-        // в случае отсутствия отправителей и механизм ретрая тут не поможет
+        // `recv()` возвращает `None`, когда все стороны-отправители `mpsc` канала дропнуты —
+        // это значит, что `amqprs` закрыл внутренний канал доставки.
+        // Ретрай здесь бессмысслен: если отправителей нет, повторный вызов тоже вернёт `None`.
         let msg = rx.recv().await.ok_or(BrokerError::NoSenders)?;
-        // Хотя все поля имеют тип Option<T>, библиотека гарантирует, что когда
-        // пользователь получит сообщение от получателя, все поля будут иметь значение Some<T>
-        let delivery = msg.deliver.unwrap();
-        let content = match serde_json::from_slice(&msg.content.unwrap()) {
+        // По текущей реализации `amqprs` все три поля обычно `Some`, но это не
+        // часть стабильного контракта (поля объявлены как `Option`). При смене
+        // версии `amqprs` или нестандартном фрейме брокера лучше получить
+        // структурированную ошибку, а не панику в worker-таске.
+        let delivery = msg.deliver.ok_or_else(|| {
+            BrokerError::Internal("amqprs: ConsumerMessage без deliver".to_owned())
+        })?;
+        let content_bytes = msg.content.ok_or_else(|| {
+            BrokerError::Internal("amqprs: ConsumerMessage без content".to_owned())
+        })?;
+        let basic_properties = msg.basic_properties.ok_or_else(|| {
+            BrokerError::Internal(
+                "amqprs: ConsumerMessage без basic_properties".to_owned(),
+            )
+        })?;
+        let content = match serde_json::from_slice(&content_bytes) {
             Ok(content) => content,
             Err(_err) => {
                 #[cfg(feature = "traces")]
@@ -166,7 +188,7 @@ impl RabbitChannel {
         let message = RabbitMessage {
             content,
             delivery,
-            properties: msg.basic_properties.unwrap(),
+            properties: basic_properties,
         };
         Ok(message)
     }
@@ -263,6 +285,11 @@ impl RabbitChannel {
         Ok(())
     }
 
+    /// Запускает все коллбэки параллельно через [`FuturesUnordered`] и ждёт их завершения.
+    ///
+    /// `FuturesUnordered` выбран намеренно: коллбэки не зависят друг от друга,
+    /// поэтому последовательный запуск был бы медленнее без какой-либо выгоды.
+    /// При первой ошибке выполнение прерывается, остальные фьючеры дропаются.
     async fn handle_callbacks<I, F>(futs: I) -> Result<()>
     where
         I: IntoIterator<Item = F>,
@@ -298,6 +325,9 @@ impl RabbitChannel {
     /// * Err([`BrokerError`]) - Ошибка при отправлении подтверждения
     pub async fn send_ack(&self, delivery: &Deliver) -> Result<()> {
         let op = || {
+            // `multiple = false`: подтверждаем только это конкретное сообщение.
+            // `multiple = true` подтвердил бы все предыдущие unacked сообщения в канале,
+            // что нарушило бы гарантии обработки при параллельном consume.
             self.channel
                 .basic_ack(BasicAckArguments::new(delivery.delivery_tag(), false))
         };
@@ -329,6 +359,9 @@ impl RabbitChannel {
     /// * Err([`BrokerError`]) - Ошибка при отправлении подтверждения
     pub async fn send_nack(&self, delivery: &Deliver) -> Result<()> {
         let op = || {
+            // `multiple = false, requeue = false`: отклоняем только это сообщение без повторной
+            // постановки в очередь. Если нужна dead-letter очередь — её настраивают на уровне
+            // декларации очереди, а не здесь.
             self.channel.basic_nack(BasicNackArguments::new(
                 delivery.delivery_tag(),
                 false,
@@ -356,6 +389,8 @@ impl RabbitChannel {
     /// * Ok([`()`]) - Успешное закрытие канала
     /// * Err([`BrokerError`]) - Ошибка при закрытии канала
     pub async fn close(self) -> Result<()> {
+        // `channel.clone()` нужен потому, что `Channel::close` принимает `self`,
+        // но внутри `amqprs` это Arc-хэндл — клонирование не дублирует сокет.
         let op = || self.channel.clone().close();
         op.retry(&self.retry_args).await.map_err(|err| {
             #[cfg(feature = "traces")]

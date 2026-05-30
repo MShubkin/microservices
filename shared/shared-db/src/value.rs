@@ -7,34 +7,42 @@ use std::fmt::{self, Display};
 use std::result::Result;
 use uuid::Uuid;
 
-/// This is a data structure to allow serialization of IntWithOriginal.
+/// Фиксированная точность: хранит целое число `int` вместо `f64`, чтобы
+/// избежать ошибок плавающей точки при сравнениях и сортировках в БД.
+///
+/// `original` и `precision` нужны только для отображения на фронтенде:
+/// `original = int / 10^precision` (с усечением до `precision` знаков).
+/// Например: `int=100_234`, `precision=3` → показываем `"100.234"`.
 #[derive(Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]
 pub struct IntWithOriginal {
-    /// The fixed precision integer value.
+    /// Целочисленное представление значения.
     pub int: i64,
-    /// The floating point value it represents.
+    /// Оригинальное число с плавающей точкой для отображения.
     pub original: f64,
-    /// The precision value that is used to transform the `int` to the `original`.
-    /// It also represents the cut-off of precision for the `original` value.
-    /// Hence if int=100_234, original=100.234002432 and precision=3, then
-    /// original should be written as "100.234".
+    /// Количество знаков после запятой у `original`.
     pub precision: u8,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)] // It is nice to be able to test this.]
+/// Универсальный тип значения для фильтров и экспорта.
+///
+/// Используется как общий язык между фронтендом и запросами к БД:
+/// сериализуется в JSON с тегом `t` (тип) и `v` (значение), что позволяет
+/// фронтенду передавать произвольные значения фильтров без типобезопасных структур.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", content = "v")]
-/// This is a data transfer object (DTO), to enable our filters to work better.
 pub enum Value {
     String(String),
-    /// This can represent any integer, we can be picky later
+    /// Любое целое число; при необходимости уточняется позже.
     Int(i64),
-    /// An integer value along with its original floating-point representation and precision.
-    /// It is used for exporting original values such as CurrencyValue, Quantity.
+    /// Целое число вместе с оригинальным float-представлением.
+    /// Нужен для экспорта денежных сумм и количеств с сохранением
+    /// исходного вида числа.
     IntWithOriginal(IntWithOriginal),
-    /// Again this can represent any float, and we can be picky later.
+    /// Любое число с плавающей точкой; уточняется при необходимости.
     Float(f64),
     Bool(bool),
     Uuid(Uuid),
+    /// Отсутствие значения -- соответствует SQL NULL.
     Null,
     Vec64(AsezArray<i64>),
     Vec32(AsezArray<i32>),
@@ -44,7 +52,12 @@ pub enum Value {
 }
 
 use sqlx::types::time::{Date, PrimitiveDateTime};
-/// Used purely for =ANY queries.
+
+/// Агрегированное значение для запросов вида `field = ANY($1)`.
+///
+/// При фильтре `In` / `NotIn` sqlx требует передать массив однородных значений.
+/// `AggrValue::build` принимает срез `Value` и собирает типизированный вектор
+/// для последующего `.bind(vec)`. Если значения разных типов -- они игнорируются.
 #[derive(Debug)]
 pub(crate) enum AggrValue<'a> {
     String(Vec<&'a str>),
@@ -55,10 +68,15 @@ pub(crate) enum AggrValue<'a> {
     Vec64(Vec<i64>),
     Date(Vec<Date>),
     Timestamp(Vec<PrimitiveDateTime>),
+    /// Нет ненулевых значений -- массив не нужен.
     Null,
 }
 
 impl<'a> AggrValue<'a> {
+    /// Строит агрегированное значение из среза [`Value`].
+    ///
+    /// Проходит по значениям, пропускает `Null`, и накапливает однотипные
+    /// значения. Несовпадающие типы молча игнорируются (ветка `_ => {}`).
     pub(crate) fn build(values: &'a [Value]) -> Self {
         use Value::*;
         let mut output = AggrValue::Null;
@@ -80,6 +98,7 @@ impl<'a> AggrValue<'a> {
                 }
                 (Date(x), AggrValue::Date(ref mut out)) => out.push(x.0),
                 (Timestamp(x), AggrValue::Timestamp(ref mut out)) => out.push(x.0),
+                // Первый ненулевой элемент инициализирует тип аккумулятора.
                 (String(x), AggrValue::Null) => {
                     output = AggrValue::String(vec![x.as_str()])
                 }
@@ -97,8 +116,6 @@ impl<'a> AggrValue<'a> {
                 _ => {}
             }
         });
-        // println!("input: {:?}", values);
-        // println!("output: {:?}", output);
         output
     }
 }
@@ -141,6 +158,11 @@ impl TryFrom<&Value> for Uuid {
 }
 
 impl Value {
+    /// Эвристика для преобразования строки: сначала пробуем timestamp, затем
+    /// дату, затем UUID, и только в конце оставляем как строку.
+    ///
+    /// Это позволяет фронтенду передавать даты и UUID просто строками,
+    /// не оборачивая их в специальные JSON-теги.
     fn from_str(v: &str) -> Self {
         if let Ok(t) = AsezTimestamp::try_from_api_format(v) {
             return Self::Timestamp(t);
@@ -202,6 +224,7 @@ where
     }
 }
 
+/// Генерирует `From<$tpe> for Value` через переданное отображение `$map`.
 macro_rules! impl_into_value {
     ($tpe:ty, $var:ident, $map:expr) => {
         impl From<$tpe> for Value {
@@ -212,6 +235,7 @@ macro_rules! impl_into_value {
     };
 }
 
+/// Генерирует конвертации в `Value::Int` для целочисленных типов (и их ссылок).
 macro_rules! impl_into_value_int {
   ($($tpe:ty),*) => {
       $(
@@ -221,6 +245,7 @@ macro_rules! impl_into_value_int {
   }
 }
 
+/// Генерирует конвертации в `Value::Float` для типов с плавающей точкой.
 macro_rules! impl_into_value_float {
   ($($tpe:ty),*) => {
       $(
@@ -230,17 +255,17 @@ macro_rules! impl_into_value_float {
   }
 }
 
-// String conversions
+// Конвертации дат и временных меток
 impl_into_value!(AsezDate, Date, |x: AsezDate| x);
 impl_into_value!(&AsezDate, Date, |x: &AsezDate| x.to_owned());
 impl_into_value!(AsezTimestamp, Timestamp, |x: AsezTimestamp| x);
 impl_into_value!(&AsezTimestamp, Timestamp, |x: &AsezTimestamp| x.to_owned());
 
-//Integer conversions
+// Конвертации целочисленных типов
 impl_into_value_int!(usize, u64, u32, u16, u8, i64, i32, i16, i8);
-// Float conversions
+// Конвертации типов с плавающей точкой
 impl_into_value_float!(f64, f32);
-// The rest.
+// Остальные конвертации
 impl_into_value!(bool, Bool, |x| x);
 impl_into_value!(Uuid, Uuid, |x| x);
 impl_into_value!(&bool, Bool, |x: &bool| *x);

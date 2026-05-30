@@ -1,4 +1,17 @@
-//! This module deals with the actix extension that was in the original library.
+//! Интеграция с Actix-Web: корневой span для каждого HTTP-запроса.
+//!
+//! `ServiceRootSpanBuilder` реализует трейт `RootSpanBuilder` из `tracing-actix-web`.
+//! Он вызывается `TracingLogger` middleware при старте и завершении каждого запроса.
+//!
+//! ## Порядок middleware важен
+//!
+//! `TracingLogger::<ServiceRootSpanBuilder>` должен быть зарегистрирован **после**
+//! middleware, которые наполняют `AsezTracingFieldsCollection` в `req.extensions()`:
+//! - `AsezSessionWatcher` — декодирует cookie, устанавливает `user_id`/`user_name`
+//! - `DomainIDsTransform` — устанавливает `object_ids`/`object_uuids`
+//!
+//! В коде Actix middleware применяются в обратном порядке относительно `.wrap()`,
+//! поэтому последний зарегистрированный через `.wrap()` выполняется первым.
 
 use actix_web::{
     dev::{ServiceRequest, ServiceResponse},
@@ -9,19 +22,17 @@ use tracing_actix_web::{root_span, DefaultRootSpanBuilder, RootSpanBuilder};
 
 use crate::tracing_fields::*;
 
-/// This struct allows us to implement the `ServiceRootSpanBuilder` for it.
+/// Построитель корневого span-а для входящих HTTP-запросов АСЭЗ.
 ///
-/// For proper tracing of common ASEZ data associated with a specific user request,
-/// the [collection](`AsezTracingFieldsCollection`) of fields containing this information is used.
-/// Some fields are taken from the collection directly, others (like user_name, object_ids, etc)
-/// are added later by other middlewares.
+/// Если в `req.extensions()` есть `AsezTracingFieldsCollection` — создаёт span
+/// с полными данными запроса (user_id, uri, source_ip и т.д.).
+/// Если коллекции нет — делегирует `root_span!(request)` из `tracing-actix-web`,
+/// который создаёт минимальный span с базовыми HTTP-полями.
 ///
-/// The instance of this collection can be injected into the request using e.g. `AsezTracingFields` middleware.
-/// If it is not present in the request, standard `actix_web_tracing` root span is used, that contains
-/// basic request information.
-///
-/// Note that a request should be processes by [ServiceRootSpanBuilder] before any other
-/// middleware that populate root span's data. Currently, `DomainIDsTransform` and `AsezSessionWatcher` do that.
+/// Поля `user_id`, `user_name`, `object_ids`, `object_uuids` объявляются как
+/// `tracing::field::Empty` при создании span-а и дозаписываются позже методом
+/// `span.record(...)`. Это необходимо, потому что tracing не позволяет добавлять
+/// новые поля после создания span-а — только обновлять уже объявленные.
 #[derive(Debug, Clone, Copy)]
 pub struct ServiceRootSpanBuilder;
 
@@ -69,6 +80,8 @@ impl RootSpanBuilder for ServiceRootSpanBuilder {
     fn on_request_start(request: &ServiceRequest) -> tracing::Span {
         let fields = {
             let mut extensions = request.extensions_mut();
+            // `tracing_actix_web` генерирует собственный RequestId — синхронизируем
+            // его с нашим `request_id` в коллекции для единого идентификатора в логах.
             let request_id =
                 extensions.get::<tracing_actix_web::RequestId>().cloned();
             extensions.get_mut::<AsezTracingFieldsCollection>().map(|fields| {
@@ -81,6 +94,8 @@ impl RootSpanBuilder for ServiceRootSpanBuilder {
         if let Some(fields) = fields {
             Self::with_tracing_fields(request, fields)
         } else {
+            // AsezTracingFieldsCollection не установлена — используем стандартный
+            // span tracing-actix-web с базовыми HTTP-полями (method, path, status).
             root_span!(request)
         }
     }
@@ -89,7 +104,8 @@ impl RootSpanBuilder for ServiceRootSpanBuilder {
         span: Span,
         outcome: &Result<ServiceResponse<B>, actix_web::Error>,
     ) {
-        // Capture the standard fields when the request finishes.
+        // Делегируем стандартной реализации — она записывает HTTP status code и
+        // помечает span как ошибочный при 5xx/ошибках actix.
         DefaultRootSpanBuilder::on_request_end(span, outcome);
     }
 }

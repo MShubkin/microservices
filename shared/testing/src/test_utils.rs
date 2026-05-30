@@ -8,7 +8,13 @@ use sqlx::PgPool;
 
 use crate::db::prepare_for_test_fixture_files;
 
-/// The enum shows where to get the base migrations.
+/// Местоположение базовых миграций для тестовой БД.
+///
+/// Разные сервисы хранят миграции в разных местах:
+/// - `MigrationsHome` → `crate/migrations/` — стандартное расположение;
+/// - `New` → `crate/migrations/new/` — для сервисов с двумя наборами миграций;
+/// - `Other(path)` → произвольный путь относительно `CARGO_MANIFEST_DIR`;
+/// - `None` — не применять базовые миграции (только fixture-файлы).
 pub enum BaseMigPath<'a> {
     MigrationsHome,
     New,

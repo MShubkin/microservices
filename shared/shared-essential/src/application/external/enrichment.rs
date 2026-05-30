@@ -469,7 +469,9 @@ async fn load_lookup_data(
     for replace_record in lookup_config.records.iter() {
         let host = &replace_record.host;
         for record in replace_record.replacements.iter() {
-            let query_url = host.join(&record.path).unwrap(); // TODO: refactor
+            // `IntegrationError::Url` импортирован через `#[from]` — пропускаем ошибку
+            // парсинга URL вверх вместо паники на потенциально невалидном конфиге.
+            let query_url = host.join(&record.path)?;
             tracing::debug!(
                 kind = "get",
                 "query url: {} [{}][{}]",

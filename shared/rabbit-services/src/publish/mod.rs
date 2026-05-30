@@ -1,3 +1,16 @@
+//! Паблишер с гарантией доставки через явное подтверждение (confirm-паттерн).
+//!
+//! [`RabbitPublisherWithConfirmation`] публикует данные в очередь и ожидает
+//! квитанцию в отдельной очереди подтверждений. Пара очередей (publish + confirm)
+//! вместе с `correlation_id` образует надёжный канал без встроенных механизмов
+//! RabbitMQ transactional confirmations.
+//!
+//! Данные для публикации подаются через `UnboundedReceiver<(T, String)>`,
+//! где второй элемент -- `request_id`, который пишется в `correlation_id` сообщения.
+//! Основной цикл `publisher_main_loop` попеременно отправляет новые данные и
+//! читает квитанции с таймаутом 100 мс -- это позволяет не блокироваться ни
+//! на публикации, ни на ожидании подтверждений.
+
 use std::{
     fmt::Debug,
     pin::Pin,
@@ -21,10 +34,12 @@ use serde::Serialize;
 use shared_essential::presentation::dto::response_request::ApiResponse;
 use tokio::sync::mpsc::{error::TryRecvError, UnboundedReceiver};
 
+/// Ошибки при публикации или получении квитанций.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("broker error: {0}")]
     Broker(#[from] BrokerError),
+    /// Канал данных закрыт -- отправитель больше не существует.
     #[error("receive channel closed: {0}")]
     Recv(#[from] TryRecvError),
     #[error("no reply-to property")]
@@ -33,6 +48,7 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Обёртка над бесконечным future паблишера. Использовать аналогично `ConsumerServer`.
 pub struct PublisherServer<'a> {
     fut: BoxFuture<'a, Result<()>>,
 }
@@ -45,7 +61,10 @@ impl<'a> std::future::Future for PublisherServer<'a> {
     }
 }
 
-/// Нотификация о получении подтверждения.
+/// Обработчик входящей квитанции от сервиса-получателя.
+///
+/// Вызывается при получении ответа в confirm-очереди.
+/// `request_id` соответствует `correlation_id` исходного сообщения.
 pub trait ConfirmationHandler {
     fn handle(&mut self, confirmation: ApiResponse<(), ()>, request_id: &str);
 }
@@ -59,15 +78,22 @@ where
     }
 }
 
+/// Паблишер с подтверждением доставки.
+///
+/// Данные поступают через `publish_rx` (пара: тело сообщения + request_id).
+/// После публикации ждёт квитанцию в `confirm_queue` и уведомляет `handler`.
+/// Обе очереди объявляются как durable при запуске, поэтому не требуют предварительной настройки.
 pub struct RabbitPublisherWithConfirmation<T, H> {
     consumer_tag: String,
     publish_queue: String,
     confirm_queue: String,
+    /// Канал входящих данных для публикации: `(тело, request_id)`.
     publish_rx: UnboundedReceiver<(T, String)>,
     rabbit_adapter: Arc<RabbitAdapter>,
     handler: H,
 }
 
+/// Внутреннее состояние после инициализации соединений с брокером.
 struct ReliableRabbitPublisherInner<T, H> {
     publish_queue: String,
     confirm_queue: String,

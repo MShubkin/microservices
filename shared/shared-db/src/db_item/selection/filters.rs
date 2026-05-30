@@ -1,6 +1,5 @@
 use std::fmt::Display;
 
-// use super::*;
 use crate::db_item::{AsezTimestamp, BindQuery};
 use crate::result::SharedDbError;
 use crate::value::{single_value, two_values};
@@ -10,13 +9,18 @@ use ahash::AHashSet;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
+/// Рекурсивное дерево фильтров для WHERE-условия.
+///
+/// Позволяет строить произвольные булевы выражения над [`Filter`]-листьями.
+/// Фронтенд отправляет дерево в JSON, бэкенд превращает его в SQL-фрагмент
+/// через [`FilterTree::build_sql`].
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FilterTree {
-    /// группа где каждый фильтр между собой связано OR.
+    /// Группа фильтров, объединённых через OR.
     Or(Vec<FilterTree>),
-    /// группа где каждый фильтр между собой связан AND.
+    /// Группа фильтров, объединённых через AND.
     And(Vec<FilterTree>),
-    /// Сам фильтр.
+    /// Листовой фильтр.
     Filter(Filter),
     #[default]
     None,
@@ -32,7 +36,7 @@ impl FilterTree {
         }
     }
 
-    // Gets a vector of references to filters.
+    /// Собирает плоский список ссылок на все листовые [`Filter`] в дереве.
     pub fn slice(&self) -> Vec<&Filter> {
         let mut output = Vec::new();
         match self {
@@ -47,7 +51,7 @@ impl FilterTree {
         output
     }
 
-    // Gets a vector of references to filters which can be edited.
+    /// Изменяемый вариант [`slice`].
     pub fn slice_mut(&mut self) -> Vec<&mut Filter> {
         let mut output = Vec::new();
         match self {
@@ -62,7 +66,7 @@ impl FilterTree {
         output
     }
 
-    // Gets a vector of references to filters which can be edited.
+    /// Потребляет дерево и возвращает все листовые фильтры.
     pub fn into_filters(self) -> Vec<Filter> {
         let mut output = Vec::new();
         match self {
@@ -77,7 +81,9 @@ impl FilterTree {
         output
     }
 
-    // Retrieves the filter and the branch it belongs to by field name.
+    /// Находит ветку дерева, содержащую фильтр по полю `field`, и возвращает
+    /// изменяемую ссылку на неё. Нужно для расширения существующего фильтра
+    /// вместо добавления нового.
     pub fn find_with_branch(&mut self, field: &str) -> Option<&mut FilterTree> {
         match self {
             Self::Filter(ref mut x) if x.field == field => Some(self),
@@ -88,6 +94,11 @@ impl FilterTree {
         }
     }
 
+    /// Добавляет фильтр в дерево.
+    ///
+    /// - `None` -> заменяется новым фильтром.
+    /// - Одиночный `Filter` -> оборачивается в `And` вместе с новым.
+    /// - `And`/`Or` -> фильтр добавляется в конец вектора.
     pub fn push_filter(&mut self, filter: Filter) {
         match self {
             FilterTree::None => *self = filter.into(),
@@ -98,6 +109,7 @@ impl FilterTree {
         };
     }
 
+    /// Удаляет все фильтры по полю `field` из дерева и возвращает их.
     pub fn remove_by_field(&mut self, field: &str) -> Vec<Filter> {
         match self {
             Self::Filter(x) if x.field == field => {
@@ -118,6 +130,10 @@ impl FilterTree {
         }
     }
 
+    /// Удаляет из дерева все фильтры, поле которых не входит в `fields`.
+    ///
+    /// Применяется при разбиении SELECT на части: каждая часть получает
+    /// только релевантные фильтры.
     pub fn purge_by_fields(&mut self, fields: &AHashSet<&str>) {
         match self {
             Self::Filter(x) if !fields.contains(&x.field as &str) => {
@@ -133,10 +149,9 @@ impl FilterTree {
         }
     }
 
-    /// Splits the filter tree into two, one mentioning specified fields, and
-    /// another the rest of them.
+    /// Разбивает дерево на два: одно с фильтрами по `fields`, второе -- с остальными.
     ///
-    /// The first filter in the result is the one that restricts `fields`.
+    /// Первый элемент результата ограничивает `fields`.
     pub fn split_by_fields(self, fields: &AHashSet<&str>) -> (Self, Self) {
         match self {
             FilterTree::None => (FilterTree::None, FilterTree::None),
@@ -157,10 +172,12 @@ impl FilterTree {
         }
     }
 
+    /// Оборачивает `self` и `x` в `And`.
     pub fn and(self, x: FilterTree) -> Self {
         FilterTree::And(vec![self, x])
     }
 
+    /// Оборачивает `self` и `x` в `Or`.
     pub fn or(self, x: FilterTree) -> Self {
         Self::Or(vec![self, x])
     }
@@ -187,9 +204,11 @@ impl FilterTree {
         Self::Or(x)
     }
 
-    /// NB: Not async, because we don't have time for async recursion
-    /// right now.
-    /// NB2: It is CRITICAL that values are binded in the same order as they are binded.
+    /// Строит SQL-фрагмент фильтрующего условия и возвращает следующий индекс привязки.
+    ///
+    /// NB: Не async, потому что рекурсия + async требует boxing. В нынешней
+    /// реализации достаточно синхронной обработки.
+    /// NB2: Переменные ОБЯЗАНЫ привязываться в том же порядке, что и здесь.
     pub(crate) fn build_sql(
         &self,
         container: &mut String,
@@ -203,7 +222,7 @@ impl FilterTree {
         }
     }
 
-    /// Used to bind values to a query. Is an inner function.
+    /// Привязывает значения фильтров к запросу в том же порядке, что `build_sql`.
     pub(crate) fn bind_vars_to_query<'a>(
         &'a self,
         query: BindQuery<'a>,
@@ -227,7 +246,8 @@ fn bind_filters<'a, 'b: 'a>(
     query
 }
 
-/// Если список пустой, мы ее игнорируем.
+/// Строит SQL-фрагмент для группы фильтров с заданным разделителем AND/OR.
+/// Пустые фильтры пропускаются.
 fn build(
     filters: &[FilterTree],
     container: &mut String,
@@ -266,6 +286,7 @@ fn build_or(
     build(filters, container, " OR", idx)
 }
 
+/// Листовой фильтр: одно условие на одно поле.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Filter {
     pub field: String,
@@ -358,7 +379,7 @@ impl Filter {
         )
     }
 
-    /// Produces "!~ $" statement" and should be used for strings
+    /// Фильтр `field !~ $1` -- регулярное выражение "не совпадает".
     pub fn not_contains<V>(field: &str, value: V) -> Self
     where
         V: Into<Value>,
@@ -373,6 +394,11 @@ impl Filter {
         Filter::with_value(field, SelectionKind::LessEqual, value)
     }
 
+    /// Строит SQL-фрагмент для этого фильтра и дописывает его в `container`.
+    ///
+    /// Обрабатывает NULL-значения: `field=NULL` -> `field IS NULL`,
+    /// смешанные списки (null + не-null) -- `(field=ANY($) OR field IS NULL)`.
+    /// Для BETWEEN на дату добавляет `+ interval '23:59:59'` к верхней границе.
     fn add_to_string(
         &self,
         container: &mut String,
@@ -382,7 +408,6 @@ impl Filter {
         let field_name = &self.field;
         let kind = self.kind;
 
-        // This closure exists for DRY.
         let binding_push = |n: usize, c: &mut String| -> usize {
             c.push('$');
             c.push_str(&n.to_string());
@@ -413,7 +438,6 @@ impl Filter {
         }
         container.push(' ');
 
-        // TODO: See if other simple types work with null.
         if kind.is_simple() {
             container.push_str(field_name);
             container.push(' ');
@@ -424,7 +448,7 @@ impl Filter {
                     container.push_str(kind.str());
                     binding = binding_push(binding, container);
                     if kind == Jsonpath {
-                        // оператор `@?` требует, чтобы правый операнд был типа `jsonpath`
+                        // Оператор `@?` требует, чтобы правый операнд был типа `jsonpath`.
                         container.push_str("::jsonpath");
                     }
                 }
@@ -438,31 +462,28 @@ impl Filter {
             container.push_str("::jsonpath");
             Ok(binding)
         } else if matches!(kind, In | NotIn) {
-            // either "field=ANY($1)" or "NOT (field=ANY($1))"
+            // Генерирует `field=ANY($1)` или `NOT (field=ANY($1))`.
             if kind == NotIn {
                 container.push_str("NOT (");
             }
             if not_null_values_count == 0 {
                 self.add_null_filter(container, field_name);
             } else {
-                // (field=ANY($) OR field IS NULL) открывает скобку
+                // Если есть и null и не-null значения -- нужна скобка для OR.
                 if not_null_values_count < self.values.len() {
                     container.push('(');
                 }
-                // create the central "field=ANY($1)"
                 container.push_str(field_name);
                 container.push_str("=ANY(");
                 binding = binding_push(binding, container);
                 container.push(')');
 
-                // Закрываем скобку для фильтра с нулем
                 if not_null_values_count < self.values.len() {
                     container.push_str(" OR ");
                     self.add_null_filter(container, field_name);
                     container.push(')');
                 }
             }
-            // Close final bracket if needed
             if kind == NotIn {
                 container.push(')');
             }
@@ -471,18 +492,15 @@ impl Filter {
             if not_null_values_count == 0 {
                 self.add_null_filter(container, field_name);
             } else {
-                // Добавление скобки для фильтра под нуль
                 if not_null_values_count < self.values.len() {
                     container.push('(');
                 }
                 container.push_str(field_name);
                 container.push(' ');
 
-                // Here we push something like "<" or "NOT IN" or "!~".
-                // For some conditions we need a space, so better safe than sorry.
                 container.push_str(kind.str());
 
-                // Here we push a sequence such as "($1,$2,$3)"
+                // Список placeholder'ов вида `($1,$2,$3)`.
                 container.push('(');
                 binding = binding_push(binding, container);
 
@@ -492,7 +510,6 @@ impl Filter {
                 }
                 container.push(')');
 
-                // Закрываем скобку для фильтра с нулем
                 if not_null_values_count < self.values.len() {
                     container.push_str(" OR ");
                     self.add_null_filter(container, field_name);
@@ -513,6 +530,7 @@ impl Filter {
                 .into());
             }
             container.push_str(&format!(" ${} AND ${}", binding, binding + 1));
+            // Для дат верхняя граница расширяется до конца дня.
             if matches!(self.values[1], Value::Date(_)) {
                 container.push_str("+ interval '23:59:59'");
             }
@@ -524,8 +542,7 @@ impl Filter {
         }
     }
 
-    // TODO: Возможно будет удалено при добавлении
-    // null типа в БД
+    // TODO: Возможно будет удалено при добавлении null типа в БД.
     fn add_null_filter(&self, container: &mut String, field_name: &str) {
         match self.kind {
             SelectionKind::Equals | SelectionKind::In => {
@@ -538,14 +555,16 @@ impl Filter {
         }
     }
 
-    /// Used to bind values to a query. Is an inner function.
+    /// Привязывает значения фильтра к запросу.
+    ///
+    /// Для `In`/`NotIn` значения упаковываются в массив через [`AggrValue::build`],
+    /// так как PostgreSQL ожидает `= ANY($1::type[])`.
+    /// Для остальных типов значения привязываются поодиночке.
     pub(crate) fn bind_filter_vars_to_query<'a>(
         &'a self,
         mut query: BindQuery<'a>,
     ) -> BindQuery<'a> {
         use crate::value::AggrValue;
-        // NB: there should be checks elsewhere to ensure that the length
-        // of values is not zero.
         if self.values.iter().all(|x| matches!(x, Value::Null))
             || self.values.is_empty()
         {
@@ -559,7 +578,7 @@ impl Filter {
                 AggrValue::Uuid(x) => query.bind(x),
                 AggrValue::Date(x) => query.bind(x),
                 AggrValue::Timestamp(x) => query.bind(x),
-                // TODO Check how badly this breaks.
+                // TODO: Проверить поведение при использовании с массивами.
                 AggrValue::Vec64(x) => query.bind(x),
                 AggrValue::Null => query,
             };
@@ -585,6 +604,10 @@ impl Filter {
         query
     }
 
+    /// Проверяет, совпадает ли `value` с этим фильтром в памяти (без БД).
+    ///
+    /// Поддерживает только `Equals` и `Contains`. Используется при локальной
+    /// фильтрации данных без обращения к PostgreSQL.
     pub fn matches_number(&self, value: i64) -> bool {
         match self.kind {
             SelectionKind::Equals => self.values.iter().any(|v| match v {
@@ -601,6 +624,9 @@ impl Filter {
         }
     }
 
+    /// Проверяет, совпадает ли `date` с этим фильтром в памяти (без БД).
+    ///
+    /// Поддерживает `Equals` (по дате без времени) и `Between`.
     pub fn matches_date(&self, date: &AsezTimestamp) -> bool {
         match self.kind {
             SelectionKind::Equals => self.values.iter().any(|v| match v {
@@ -630,8 +656,8 @@ impl Filter {
     }
 }
 
+/// Тип условия фильтра. Определяет SQL-оператор.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
-/// Section type of the filter. This defines the logic, giving an `AND`, `NOT` or `OR` clause.
 #[serde(rename_all = "snake_case")]
 pub enum SelectionKind {
     Equals = 1,
@@ -642,13 +668,19 @@ pub enum SelectionKind {
     GreaterEqual = 6,
     Mask = 7,    // TODO
     NotMask = 8, // TODO
+    /// Регулярное совпадение (`~`).
     Contains = 9,
+    /// Регулярное несовпадение (`!~`).
     NotContains = 10,
-    /// NB: BETWEEN is inclusive as it is in postgres.
+    /// BETWEEN -- включающий с обеих сторон (как в PostgreSQL).
     Between = 11,
+    /// `= ANY($1)` -- эффективнее чем IN для больших списков.
     In = 12,
+    /// `NOT (= ANY($1))`.
     NotIn = 13,
+    /// Фильтрация по jsonpath через оператор `@?`.
     Jsonpath = 14,
+    /// `&&` -- перекрытие массивов PostgreSQL.
     Overlaps = 15,
 }
 
@@ -679,6 +711,7 @@ impl SelectionKind {
         }
     }
 
+    /// "Простые" операторы: принимают ровно одно значение и не требуют скобок.
     pub(crate) fn is_simple(&self) -> bool {
         use SelectionKind::*;
         matches!(
@@ -699,6 +732,7 @@ impl SelectionKind {
         matches!(self, Jsonpath)
     }
 
+    /// Операторы, генерирующие список значений в скобках `($1,$2,...)`.
     fn is_in_brackets(&self) -> bool {
         use SelectionKind::*;
         matches!(self, In | NotIn)
@@ -733,7 +767,7 @@ fn jsonpath_op(selection_kind: SelectionKind) -> &'static str {
     }
 }
 
-/// Типаж фильтра.
+/// Типаж фильтра -- абстракция над конкретным типом фильтра.
 pub trait FilterTrait {
     /// Тип значений, хранимых фильтром.
     type ValueType;
@@ -748,7 +782,7 @@ pub trait FilterTrait {
 //
 // Для примера, FE оперирует параметрами маршрута `department_id` и
 // `division_id`, но в реальности в БД нет таких колонок. Эти значения находятся
-// в поле `data` таблицы `RouteData`, причем обернутые в стркутуру с ключем
+// в поле `data` таблицы `RouteData`, причем обернутые в структуру с ключем
 // `assign_department`.
 //
 // Для того, чтобы выполнить фильтрацию по этим значениям, нам надо воспользоваться
@@ -806,9 +840,11 @@ where
     })
 }
 
-/// Утилита для преобразования абстрактных фильтров для `json_field`,
-/// являющегося полем JSON структуры, которая хранится в БД в колонке `db_field`,
-/// и находится в объекте, доступном по пути `jsonpath`.
+/// Преобразует набор абстрактных фильтров по полю `json_field` в jsonpath-фильтры
+/// для колонки `db_field`.
+///
+/// Применяется когда фронтенд фильтрует по виртуальным полям, которых нет
+/// в виде отдельных колонок -- они хранятся внутри JSON-поля таблицы.
 ///
 /// Например, данные маршрута ПД хранятся в поле `data` таблицы `RouteData`:
 ///
@@ -837,6 +873,10 @@ where
         .collect::<Result<_>>()
 }
 
+/// Извлекает значение из фильтра типа `Equals` с ровно одним элементом.
+///
+/// Удобная утилита для мест, где фильтр обязан содержать ровно одно значение
+/// для операции равенства (например, фильтр по булевому флагу).
 pub fn convert_filters_equal_to_value<F>(filters: &[F]) -> Result<&F::ValueType>
 where
     F: FilterTrait + std::fmt::Debug,
